@@ -1,6 +1,7 @@
 import { useFetcher } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { useAppBridge } from "@shopify/app-bridge-react";
 
 // ── BACKEND ──────────────────────────────────────────────────────────────────
 
@@ -31,8 +32,8 @@ export const action = async ({ request }) => {
   const shopId = shop.id;
   const currentSku = shop.metafield ? parseInt(shop.metafield.value) : 1000;
   const skuString = String(currentSku).padStart(6, "0");
+  const titleString = `${currentSku} - `;
 
-  // Log so we can confirm what's being read
   console.log("Shop ID:", shopId);
   console.log("Current SKU:", currentSku);
 
@@ -54,9 +55,10 @@ export const action = async ({ request }) => {
     {
       variables: {
         input: {
-          title: skuString,
+          title: titleString,
           handle: `item-${skuString}`,
           status: "DRAFT",
+          vendor: "0",
           productOptions: [
             { name: "Title", values: [{ name: "Default Title" }] }
           ],
@@ -124,6 +126,7 @@ export const action = async ({ request }) => {
 
 export default function Index() {
   const fetcher = useFetcher();
+  const shopify = useAppBridge();
 
   const isLoading =
     ["loading", "submitting"].includes(fetcher.state) &&
@@ -141,6 +144,18 @@ export default function Index() {
           >
             Generate Next SKU
           </s-button>
+          {fetcher.data?.productId && (
+            <s-button
+              onClick={() => {
+                shopify.intents.invoke?.("edit:shopify/Product", {
+                  value: fetcher.data?.productId,
+                });
+              }}
+              variant="tertiary"
+            >
+              Edit Product
+            </s-button>
+          )}
         </s-stack>
 
         {fetcher.data?.sku && (
