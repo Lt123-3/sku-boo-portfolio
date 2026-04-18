@@ -219,7 +219,7 @@ export const action = async ({ request }) => {
   } catch (err) {
     console.error("[action] Failed to write SkuLog to SQLite:", err);
   }
-  
+
   // --- Trim log to most recent 10 entries ---
   try {
     const oldest = await db.skuLog.findMany({
@@ -328,143 +328,133 @@ export default function Index() {
   return (
     <s-page heading="SKU Boo">
 
-      {/* ── SKU Generator ── */}
-      <s-section heading="SKU Generator">
-        <s-stack direction="inline" gap="base">
-          <s-button
-            onClick={generateSku}
-            {...(isLoading ? { loading: true } : {})}
-          >
-            Generate Next SKU
-          </s-button>
+{/* ── SKU Generator + Log ── */}
+<s-section heading="SKU Generator">
+  <s-stack direction="inline" gap="base">
+    <s-button
+      onClick={generateSku}
+      {...(isLoading ? { loading: true } : {})}
+    >
+      Generate Next SKU
+    </s-button>
 
-          {fetcher.data?.productId && (
-            <s-button
-              onClick={() => openProductEditor(fetcher.data.productId)}
-              variant="tertiary"
-            >
-              Edit Product
-            </s-button>
+    {fetcher.data?.productId && (
+      <s-button
+        onClick={() => openProductEditor(fetcher.data.productId)}
+        variant="tertiary"
+      >
+        Edit Product
+      </s-button>
+    )}
+  </s-stack>
+
+  {fetcher.data?.sku && (
+    <s-box padding="small" background="success-subdued" borderRadius="base">
+      <s-paragraph>
+        ✓ Created SKU <strong>{fetcher.data.sku}</strong>
+      </s-paragraph>
+    </s-box>
+  )}
+
+  {fetcher.data?.error && (
+    <s-box padding="small" background="critical-subdued" borderRadius="base">
+      <s-paragraph>Error: {fetcher.data.error}</s-paragraph>
+    </s-box>
+  )}
+
+  <s-box border="base" background="base" borderRadius="base" padding="base">
+    <div style={{ maxHeight: "75vh", overflowY: "auto" }}>
+      <s-table>
+        <s-table-header-row>
+          <s-table-header list-slot="primary">Product</s-table-header>
+          <s-table-header list-slot="labeled">Title</s-table-header>
+          <s-table-header list-slot="labeled">Date Created</s-table-header>
+          <s-table-header list-slot="inline">Actions</s-table-header>
+        </s-table-header-row>
+
+        <s-table-body>
+          {recentSkus.length === 0 && (
+            <s-table-row>
+              <s-table-cell>
+                <s-paragraph>No SKUs generated yet.</s-paragraph>
+              </s-table-cell>
+            </s-table-row>
           )}
-        </s-stack>
 
-        {fetcher.data?.sku && (
-          <s-box padding="small" background="success-subdued" borderRadius="base">
-            <s-paragraph>
-              ✓ Created SKU <strong>{fetcher.data.sku}</strong>
-            </s-paragraph>
-          </s-box>
-        )}
+          {recentSkus.map((entry) => {
+            const live = productMap?.[entry.productId];
+            const displayTitle = live?.title ?? entry.title;
+            const displayImage = live?.imageUrl ?? entry.imageUrl;
+            const displayDate = new Date(entry.createdAt).toLocaleDateString();
 
-        {fetcher.data?.error && (
-          <s-box padding="small" background="critical-subdued" borderRadius="base">
-            <s-paragraph>Error: {fetcher.data.error}</s-paragraph>
-          </s-box>
-        )}
-      </s-section>
+            return (
+              <s-table-row key={entry.id}>
 
-      {/* ── Product Log ── */}
-      <s-section heading="Recently Generated SKUs">
+                {/* Col 1 — Image */}
+                <s-table-cell>
+                  <div style={{ width: "60px", height: "60px", flexShrink: 0 }}>
+                    {displayImage ? (
+                      <img
+                        src={displayImage}
+                        alt={displayTitle}
+                        style={{
+                          width: "60px",
+                          height: "60px",
+                          objectFit: "cover",
+                          borderRadius: "6px",
+                          display: "block",
+                        }}
+                      />
+                    ) : (
+                      <div
+                        style={{
+                          width: "60px",
+                          height: "60px",
+                          background: "#f1f1f1",
+                          borderRadius: "6px",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          fontSize: "20px",
+                          color: "#999",
+                        }}
+                      >
+                        📦
+                      </div>
+                    )}
+                  </div>
+                </s-table-cell>
 
-        {loaderError && (
-          <s-box padding="base">
-            <s-paragraph>{loaderError}</s-paragraph>
-          </s-box>
-        )}
+                {/* Col 2+3 — Title */}
+                <s-table-cell>
+                  <s-box paddingBlock="small">
+                    <s-text type="strong">{displayTitle}</s-text>
+                  </s-box>
+                </s-table-cell>
 
-        <s-box border="base" background="base" borderRadius="base" padding="base">
-          <div style={{ maxHeight: "75vh", overflowY: "auto" }}>
-            <s-table>
-              <s-table-header-row>
-                <s-table-header list-slot="primary">Product</s-table-header>
-                <s-table-header list-slot="labeled">SKU</s-table-header>
-                <s-table-header list-slot="labeled">Date Created</s-table-header>
-                <s-table-header list-slot="inline">Actions</s-table-header>
-              </s-table-header-row>
+                {/* Col 4 — Time ago */}
+                <s-table-cell>
+                  <TimeAgo date={entry.createdAt} />
+                </s-table-cell>
 
-              <s-table-body>
-                {recentSkus.length === 0 && (
-                  <s-table-row>
-                    <s-table-cell>
-                      <s-paragraph>No SKUs generated yet.</s-paragraph>
-                    </s-table-cell>
-                  </s-table-row>
-                )}
+                {/* Col 5 — Edit button */}
+                <s-table-cell>
+                  <s-button
+                    variant="tertiary"
+                    onClick={() => openProductEditor(entry.productId)}
+                  >
+                    Edit
+                  </s-button>
+                </s-table-cell>
 
-                {recentSkus.map((entry) => {
-                  const live = productMap?.[entry.productId];
-                  const displayTitle = live?.title ?? entry.title;
-                  const displayImage = live?.imageUrl ?? entry.imageUrl;
-                  const displayDate = new Date(entry.createdAt).toLocaleDateString();
-
-                  return (
-                    <s-table-row key={entry.id}>
-
-                      {/* Col 1 — Image (1/5) */}
-                      <s-table-cell>
-                        <div style={{ width: "60px", height: "60px", flexShrink: 0 }}>
-                          {displayImage ? (
-                            <img
-                              src={displayImage}
-                              alt={displayTitle}
-                              style={{
-                                width: "60px",
-                                height: "60px",
-                                objectFit: "cover",
-                                borderRadius: "6px",
-                                display: "block",
-                              }}
-                            />
-                          ) : (
-                            <div
-                              style={{
-                                width: "60px",
-                                height: "60px",
-                                background: "#f1f1f1",
-                                borderRadius: "6px",
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                fontSize: "20px",
-                                color: "#999",
-                              }}
-                            >
-                              📦
-                            </div>
-                          )}
-                        </div>
-                      </s-table-cell>
-
-                      {/* Col 2+3 — Title + SKU (2nd and 3rd fifth) */}
-                      <s-table-cell>
-                        <s-box paddingBlock="small">
-                          <s-text type="strong">{displayTitle}</s-text>
-                        </s-box>
-                      </s-table-cell>
-
-                      {/* Col 4 — Time ago */}
-                      <s-table-cell>
-                        <TimeAgo date={entry.createdAt} />
-                      </s-table-cell>
-
-                      {/* Col 5 — Edit button */}
-                      <s-table-cell>
-                        <s-button
-                          variant="tertiary"
-                          onClick={() => openProductEditor(entry.productId)}
-                        >
-                          Edit
-                        </s-button>
-                      </s-table-cell>
-
-                    </s-table-row>
-                  );
-                })}
-              </s-table-body>
-            </s-table>
-          </div>
-        </s-box>
-      </s-section>
+              </s-table-row>
+            );
+          })}
+        </s-table-body>
+      </s-table>
+    </div>
+  </s-box>
+</s-section>
     </s-page>
   );
 }
