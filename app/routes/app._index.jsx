@@ -1,13 +1,20 @@
-import { useFetcher } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
+import db from "../db.server";
+import { useFetcher, useLoaderData } from "react-router";
 
 // ── BACKEND ──────────────────────────────────────────────────────────────────
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
-  return null;
+  
+  const recentSkus = await db.skuLog.findMany({
+    orderBy: { createdAt: "desc" },
+    take: 20,
+  });
+
+  return { recentSkus };
 };
 
 export const action = async ({ request }) => {
@@ -119,6 +126,15 @@ export const action = async ({ request }) => {
   const metafieldsData = await metafieldsResponse.json();
   console.log("Metafield result:", JSON.stringify(metafieldsData.data.metafieldsSet));
 
+  await db.skuLog.create({
+    data: {
+      sku: skuString,
+      productId: product.id,
+      title: titleString,
+      imageUrl: null,
+    },
+  });
+
   return { sku: skuString, productId: product.id };
 };
 
@@ -127,6 +143,7 @@ export const action = async ({ request }) => {
 export default function Index() {
   const fetcher = useFetcher();
   const shopify = useAppBridge();
+  const loaderData = useLoaderData();
 
   const isLoading =
     ["loading", "submitting"].includes(fetcher.state) &&
@@ -165,6 +182,30 @@ export default function Index() {
             </s-paragraph>
           </s-section>
         )}
+      </s-section>
+      <s-section heading="Recently Generated SKUs">
+        {loaderData?.recentSkus?.length === 0 && (
+          <s-paragraph>No SKUs generated yet.</s-paragraph>
+        )}
+        {loaderData?.recentSkus?.map((entry) => (
+          <s-box
+            key={entry.id}
+            padding="base"
+            borderWidth="base"
+            borderRadius="base"
+          >
+            <s-stack direction="inline" gap="base">
+              {entry.imageUrl && (
+                <img src={entry.imageUrl} alt={entry.sku} style={{ width: "50px", height: "50px", objectFit: "cover" }} />
+              )}
+              <s-stack direction="block" gap="none">
+                <s-text fontWeight="bold">{entry.sku}</s-text>
+                <s-text>{entry.title}</s-text>
+                <s-text>{new Date(entry.createdAt).toLocaleString()}</s-text>
+              </s-stack>
+            </s-stack>
+          </s-box>
+        ))}
       </s-section>
     </s-page>
   );

@@ -32,3 +32,12 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+model SkuLog {
+  id          Int      @id @default(autoincrement())
+  sku         String
+  productId   String
+  title       String
+  imageUrl    String?
+  createdAt   DateTime @default(now())
+}

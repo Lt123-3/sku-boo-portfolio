@@ -1,0 +1,9 @@
+-- CreateTable
+CREATE TABLE "SkuLog" (
+    "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "sku" TEXT NOT NULL,
+    "productId" TEXT NOT NULL,
+    "title" TEXT NOT NULL,
+    "imageUrl" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
