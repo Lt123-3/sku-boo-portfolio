@@ -1,7 +1,7 @@
 // app/config.js
 
 // ── SKU Metafield ─────────────────────────────────────────────────────────────
-export const METAFIELD_NAMESPACE = "inventory";
+export const METAFIELD_NAMESPACE = "custom";
 export const METAFIELD_KEY = "next_sku";
 
 // ── Product Defaults ──────────────────────────────────────────────────────────

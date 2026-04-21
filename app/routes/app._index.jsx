@@ -1,4 +1,4 @@
-// app/routes/_index.jsx
+// app/routes/app._index.jsx
 
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
@@ -85,21 +85,76 @@ export const loader = async ({ request }) => {
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
 
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  // --- Handle delete ---
+  if (intent === "delete") {
+    const productId = formData.get("productId");
+    const skuLogId = formData.get("skuLogId");
+
+    if (!productId || !skuLogId) {
+      return { error: "Missing product ID or log ID for deletion." };
+    }
+
+    // --- Delete from Shopify ---
+    try {
+      const deleteResponse = await admin.graphql(
+        `#graphql
+        mutation productDelete($id: ID!) {
+          productDelete(input: { id: $id }) {
+            deletedProductId
+            userErrors {
+              field
+              message
+            }
+          }
+        }`,
+        { variables: { id: productId } }
+      );
+
+      const deleteData = await deleteResponse.json();
+      const userErrors = deleteData.data.productDelete.userErrors;
+
+      if (userErrors.length > 0) {
+        console.error("[action] productDelete userErrors:", userErrors);
+        return { error: userErrors.map((e) => e.message).join(", ") };
+      }
+
+      console.log("[action] Deleted product:", deleteData.data.productDelete.deletedProductId);
+    } catch (err) {
+      console.error("[action] Failed to delete product from Shopify:", err);
+      return { error: "Failed to delete product from Shopify." };
+    }
+
+    // --- Delete from SQLite ---
+    try {
+      await db.skuLog.delete({
+        where: { id: parseInt(skuLogId) },
+      });
+    } catch (err) {
+      console.error("[action] Failed to delete SkuLog entry:", err);
+      return { error: "Product deleted from Shopify but failed to remove from log." };
+    }
+
+    return { deleted: true };
+  }
+
   // --- Read metafield ---
   let metafieldData;
   try {
     const metafieldQuery = await admin.graphql(
-  `#graphql
-  query getShopAndSku {
-    shop {
-      id
-      metafield(namespace: "inventory", key: "next_sku") {
-        id
-        value
-      }
-    }
-  }`
-);
+      `#graphql
+      query getShopAndSku {
+        shop {
+          id
+          metafield(namespace: "custom", key: "next_sku") {
+            id
+            value
+          }
+        }
+      }`
+    );
     metafieldData = await metafieldQuery.json();
   } catch (err) {
     console.error("[action] Failed to query shop metafield:", err);
@@ -108,6 +163,30 @@ export const action = async ({ request }) => {
 
   const shop = metafieldData.data.shop;
   const shopId = shop.id;
+
+  // --- Get primary location ---
+  let locationId;
+  try {
+    const locationResponse = await admin.graphql(
+      `#graphql
+      query getLocation {
+        locations(first: 1) {
+          edges {
+            node {
+              id
+            }
+          }
+        }
+      }`
+    );
+    const locationData = await locationResponse.json();
+    locationId = locationData.data.locations.edges[0]?.node?.id;
+    if (!locationId) throw new Error("No location found");
+  } catch (err) {
+    console.error("[action] Failed to get location ID:", err);
+    return { error: "Failed to get store location." };
+  }
+
   const currentSku = shop.metafield ? parseInt(shop.metafield.value) : DEFAULT_SKU_START;
   const skuString = String(currentSku).padStart(6, "0");
   const titleString = `${currentSku} - `;
@@ -147,6 +226,16 @@ export const action = async ({ request }) => {
                 sku: skuString,
                 price: DEFAULT_PRICE,
                 optionValues: [{ optionName: "Title", name: "Default Title" }],
+                inventoryItem: {
+                  tracked: true,
+                },
+                inventoryQuantities: [
+                  {
+                    locationId: locationId,
+                    name: "available",
+                    quantity: 0,
+                  },
+                ],
               },
             ],
           },
@@ -332,7 +421,7 @@ export default function Index() {
     ["loading", "submitting"].includes(fetcher.state) &&
     fetcher.formMethod === "POST";
 
-  const generateSku = () => fetcher.submit({}, { method: "POST" });
+  const generateSku = () => fetcher.submit({ intent: "generate" }, { method: "POST" });
 
   const openProductEditor = (productId) => {
     shopify.intents.invoke?.("edit:shopify/Product", { value: productId });
@@ -460,14 +549,37 @@ export default function Index() {
                         <TimeAgo date={entry.createdAt} />
                       </s-table-cell>
 
-                      {/* Col 5 — Edit button */}
+                      {/* Col 5 — Actions */}
                       <s-table-cell>
-                        <s-button
-                          variant="tertiary"
-                          onClick={() => openProductEditor(entry.productId)}
-                        >
-                          Edit
-                        </s-button>
+                        <s-stack direction="inline" gap="small">
+                          <s-button
+                            variant="tertiary"
+                            onClick={() => openProductEditor(entry.productId)}
+                          >
+                            Edit
+                          </s-button>
+                          <s-button
+                            variant="tertiary"
+                            tone="critical"
+                            onClick={() => {
+                              const confirmed = window.confirm(
+                                `Delete SKU ${entry.sku}?\n\nThis will permanently remove the product from Shopify and the log. This cannot be undone.`
+                              );
+                              if (confirmed) {
+                                fetcher.submit(
+                                  {
+                                    intent: "delete",
+                                    productId: entry.productId,
+                                    skuLogId: String(entry.id),
+                                  },
+                                  { method: "POST" }
+                                );
+                              }
+                            }}
+                          >
+                            Delete
+                          </s-button>
+                        </s-stack>
                       </s-table-cell>
 
                     </s-table-row>
