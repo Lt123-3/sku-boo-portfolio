@@ -41,3 +41,25 @@ model SkuLog {
   imageUrl    String?
   createdAt   DateTime @default(now())
 }
+
+model SkuIndex {
+  id          Int       @id @default(autoincrement())
+  skuNumber   String    @unique
+  taken       Boolean   @default(false)
+  titleTaken  Boolean   @default(false)
+  productId   String?
+  title       String?
+  status      String    @default("free") // free | active | reserved | problem
+  reservedAt  DateTime?
+  reservedBy  String?
+  updatedAt   DateTime  @updatedAt
+}
+
+model DuplicateLog {
+  id         Int      @id @default(autoincrement())
+  skuNumber  String
+  productId  String
+  title      String?
+  detectedAt DateTime @default(now())
+  resolved   Boolean  @default(false)
+}
