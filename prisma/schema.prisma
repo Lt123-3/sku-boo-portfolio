@@ -29,6 +29,8 @@ model Session {
   refreshTokenExpires DateTime?
 }
 
+
+
 model SkuLog {
   id        Int      @id @default(autoincrement())
   sku       String
@@ -58,6 +60,20 @@ model SkuIndex {
   @@index([shopId, status])
   @@index([shopId, status, skuNumber])
   @@index([warehouseStatus])
+}
+
+model SkuSession {
+  id        Int      @id @default(autoincrement())
+  sessionId String   @unique
+  userId    String
+  shopId    String
+  username  String
+  role      String   @default("operator")
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+  @@index([shopId])
 }
 
 model AccessKey {

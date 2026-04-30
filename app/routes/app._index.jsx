@@ -3,10 +3,10 @@
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
-import db from "../db.server";
+import prisma from "../db.server";
 import { useFetcher, useLoaderData } from "react-router";
 import { useState, useEffect } from "react";
-import { requireAccess } from "../lib/access.server.js";
+import { validateSkuSession, cleanExpiredSessions } from "../lib/access.server.js";
 
 import {
   METAFIELD_NAMESPACE,
@@ -23,33 +23,25 @@ import {
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
+  const shopId = session.shop;
 
-  console.log("[index loader] session.shop:", session.shop);
-  
-  
-  const accessResult = await requireAccess(request, session.shop);
-  console.log("[index loader] accessResult type:", accessResult instanceof Response ? "REDIRECT" : "USER DATA");
-    
-  console.log("[index loader] accessResult type:", accessResult instanceof Response ? "REDIRECT" : "USER DATA");
-  console.log("[index loader] accessResult:", JSON.stringify(accessResult));
-  
-  if (accessResult instanceof Response) return accessResult;
-  const { username, role } = accessResult;
+  // --- Clean up expired sessions occasionally ---
+  await cleanExpiredSessions();
 
   // --- Read recent SKU log from SQLite ---
   let recentSkus = [];
   try {
-    recentSkus = await db.skuLog.findMany({
+    recentSkus = await prisma.skuLog.findMany({
       orderBy: { createdAt: "desc" },
       take: LOG_PAGE_SIZE,
     });
   } catch (err) {
     console.error("[loader] Failed to read SkuLog from SQLite:", err);
-    return { recentSkus: [], productMap: {}, loaderError: "Could not load SKU log." };
+    return { recentSkus: [], productMap: {}, loaderError: "Could not load SKU log.", shopId };
   }
 
   if (recentSkus.length === 0) {
-    return { recentSkus: [], productMap: {}, username, role };
+    return { recentSkus: [], productMap: {}, shopId };
   }
 
   // --- Batch-fetch live product data from Shopify ---
@@ -65,9 +57,7 @@ export const loader = async ({ request }) => {
           ... on Product {
             id
             title
-            featuredImage {
-              url
-            }
+            featuredImage { url }
           }
         }
       }`,
@@ -77,63 +67,64 @@ export const loader = async ({ request }) => {
     const nodesData = await nodesResponse.json();
 
     if (nodesData.errors) {
-      console.error("[loader] GraphQL errors fetching product nodes:", nodesData.errors);
+      console.error("[loader] GraphQL errors:", nodesData.errors);
     } else {
       for (const node of nodesData.data.nodes) {
         if (node && node.__typename === "Product") {
           productMap[node.id] = {
-            title: node.title,
+            title:    node.title,
             imageUrl: node.featuredImage?.url ?? null,
           };
         }
       }
     }
   } catch (err) {
-    console.error("[loader] Failed to fetch product nodes from Shopify:", err);
+    console.error("[loader] Failed to fetch product nodes:", err);
   }
 
-  return { recentSkus, productMap, username, role };
+  return { recentSkus, productMap, shopId };
 };
 
 export const action = async ({ request }) => {
-  // --- Fix: destructure session alongside admin ---
   const { admin, session } = await authenticate.admin(request);
-
-  // --- Check SKU Boo access key session ---
-  const accessResult = await requireAccess(request, session.shop);
-  if (accessResult instanceof Response) return accessResult;
-  const { username, role } = accessResult;
+  const shopId = session.shop;
 
   const formData = await request.formData();
-  const intent = formData.get("intent");
+  const intent    = formData.get("intent");
+  const sessionId = formData.get("sessionId")?.toString().trim();
+
+  // --- Validate SKU Boo session on every action ---
+  const skuSession = await validateSkuSession({ sessionId, shopId });
+  if (!skuSession) {
+    return new Response(
+      JSON.stringify({ needsAuth: true }),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  }
 
   // --- Handle delete ---
   if (intent === "delete") {
     const productId = formData.get("productId");
-    const skuLogId = formData.get("skuLogId");
+    const skuLogId  = formData.get("skuLogId");
 
     if (!productId || !skuLogId) {
       return { error: "Missing product ID or log ID for deletion." };
     }
 
-    // --- Delete from Shopify ---
     try {
       const deleteResponse = await admin.graphql(
         `#graphql
         mutation productDelete($id: ID!) {
           productDelete(input: { id: $id }) {
             deletedProductId
-            userErrors {
-              field
-              message
-            }
+            userErrors { field message }
           }
         }`,
         { variables: { id: productId } }
       );
 
-      const deleteData = await deleteResponse.json();
-      const userErrors = deleteData.data.productDelete.userErrors;
+      const deleteData  = await deleteResponse.json();
+      const userErrors  = deleteData.data.productDelete.userErrors;
 
       if (userErrors.length > 0) {
         console.error("[action] productDelete userErrors:", userErrors);
@@ -142,15 +133,12 @@ export const action = async ({ request }) => {
 
       console.log("[action] Deleted product:", deleteData.data.productDelete.deletedProductId);
     } catch (err) {
-      console.error("[action] Failed to delete product from Shopify:", err);
+      console.error("[action] Failed to delete product:", err);
       return { error: "Failed to delete product from Shopify." };
     }
 
-    // --- Delete from SQLite ---
     try {
-      await db.skuLog.delete({
-        where: { id: parseInt(skuLogId) },
-      });
+      await prisma.skuLog.delete({ where: { id: parseInt(skuLogId) } });
     } catch (err) {
       console.error("[action] Failed to delete SkuLog entry:", err);
       return { error: "Product deleted from Shopify but failed to remove from log." };
@@ -180,7 +168,7 @@ export const action = async ({ request }) => {
     return { error: "Failed to read SKU counter from Shopify." };
   }
 
-  const shop = metafieldData.data.shop;
+  const shop    = metafieldData.data.shop;
   const shopGid = shop.id;
 
   // --- Get primary location ---
@@ -190,11 +178,7 @@ export const action = async ({ request }) => {
       `#graphql
       query getLocation {
         locations(first: 1) {
-          edges {
-            node {
-              id
-            }
-          }
+          edges { node { id } }
         }
       }`
     );
@@ -206,12 +190,13 @@ export const action = async ({ request }) => {
     return { error: "Failed to get store location." };
   }
 
-  const currentSku = shop.metafield ? parseInt(shop.metafield.value) : DEFAULT_SKU_START;
-  const skuString = String(currentSku).padStart(6, "0");
+  const currentSku  = shop.metafield ? parseInt(shop.metafield.value) : DEFAULT_SKU_START;
+  const skuString   = String(currentSku).padStart(6, "0");
   const titleString = `${currentSku} - `;
 
   console.log("[action] Shop GID:", shopGid);
   console.log("[action] Current SKU:", currentSku);
+  console.log("[action] Generated by:", skuSession.username);
 
   // --- Create product ---
   let product;
@@ -220,20 +205,14 @@ export const action = async ({ request }) => {
       `#graphql
       mutation productSet($input: ProductSetInput!) {
         productSet(input: $input) {
-          product {
-            id
-            title
-          }
-          userErrors {
-            field
-            message
-          }
+          product { id title }
+          userErrors { field message }
         }
       }`,
       {
         variables: {
           input: {
-            title: titleString,
+            title:  titleString,
             handle: `${PRODUCT_HANDLE_PREFIX}${skuString}`,
             status: "DRAFT",
             vendor: DEFAULT_VENDOR,
@@ -242,18 +221,12 @@ export const action = async ({ request }) => {
             ],
             variants: [
               {
-                sku: skuString,
-                price: DEFAULT_PRICE,
+                sku:          skuString,
+                price:        DEFAULT_PRICE,
                 optionValues: [{ optionName: "Title", name: "Default Title" }],
-                inventoryItem: {
-                  tracked: true,
-                },
+                inventoryItem: { tracked: true },
                 inventoryQuantities: [
-                  {
-                    locationId: locationId,
-                    name: "available",
-                    quantity: 0,
-                  },
+                  { locationId, name: "available", quantity: 0 },
                 ],
               },
             ],
@@ -263,7 +236,7 @@ export const action = async ({ request }) => {
     );
 
     const productData = await productResponse.json();
-    const userErrors = productData.data.productSet.userErrors;
+    const userErrors  = productData.data.productSet.userErrors;
 
     if (userErrors.length > 0) {
       console.error("[action] productSet userErrors:", userErrors);
@@ -282,14 +255,8 @@ export const action = async ({ request }) => {
       `#graphql
       mutation setNextSku($metafields: [MetafieldsSetInput!]!) {
         metafieldsSet(metafields: $metafields) {
-          metafields {
-            id
-            value
-          }
-          userErrors {
-            field
-            message
-          }
+          metafields { id value }
+          userErrors { field message }
         }
       }`,
       {
@@ -297,50 +264,43 @@ export const action = async ({ request }) => {
           metafields: [
             {
               namespace: METAFIELD_NAMESPACE,
-              key: METAFIELD_KEY,
-              ownerId: shopGid,
-              type: "number_integer",
-              value: String(currentSku + 1),
+              key:       METAFIELD_KEY,
+              ownerId:   shopGid,
+              type:      "number_integer",
+              value:     String(currentSku + 1),
             },
           ],
         },
       }
     );
 
-    const metafieldsData = await metafieldsResponse.json();
-    const metaUserErrors = metafieldsData.data.metafieldsSet.userErrors;
+    const metafieldsData  = await metafieldsResponse.json();
+    const metaUserErrors  = metafieldsData.data.metafieldsSet.userErrors;
     if (metaUserErrors.length > 0) {
       console.error("[action] metafieldsSet userErrors:", metaUserErrors);
     }
-    console.log("[action] Metafield result:", JSON.stringify(metafieldsData.data.metafieldsSet));
   } catch (err) {
     console.error("[action] Failed to increment SKU counter:", err);
   }
 
   // --- Write to SQLite log ---
   try {
-    await db.skuLog.create({
-      data: {
-        sku: skuString,
-        productId: product.id,
-        title: titleString,
-        imageUrl: null,
-      },
+    await prisma.skuLog.create({
+      data: { sku: skuString, productId: product.id, title: titleString, imageUrl: null },
     });
   } catch (err) {
-    console.error("[action] Failed to write SkuLog to SQLite:", err);
+    console.error("[action] Failed to write SkuLog:", err);
   }
 
-  // --- Trim log to most recent 50 entries ---
+  // --- Trim log to 50 entries ---
   try {
-    const oldest = await db.skuLog.findMany({
+    const oldest = await prisma.skuLog.findMany({
       orderBy: { createdAt: "desc" },
-      skip: LOG_PAGE_SIZE,
-      select: { id: true },
+      skip:    LOG_PAGE_SIZE,
+      select:  { id: true },
     });
-
     if (oldest.length > 0) {
-      await db.skuLog.deleteMany({
+      await prisma.skuLog.deleteMany({
         where: { id: { in: oldest.map((r) => r.id) } },
       });
     }
@@ -353,6 +313,7 @@ export const action = async ({ request }) => {
 
 // ── FRONTEND ──────────────────────────────────────────────────────────────────
 
+// ── TimeAgo Component ─────────────────────────────────────────────────────────
 function getTimeAgo(date) {
   const seconds = Math.floor((Date.now() - new Date(date)) / 1000);
   if (seconds < 60) return `${seconds}s ago`;
@@ -382,37 +343,34 @@ function TimeAgo({ date }) {
         onMouseEnter={() => setShowTooltip(true)}
         onMouseLeave={() => setShowTooltip(false)}
         style={{
-          display: "inline-block",
-          background: "#e8f0fe",
-          color: "#005bd3",
-          fontWeight: 500,
-          cursor: "pointer",
-          fontSize: "12px",
-          padding: "3px 10px",
+          display:      "inline-block",
+          background:   "#e8f0fe",
+          color:        "#005bd3",
+          fontWeight:   500,
+          cursor:       "pointer",
+          fontSize:     "12px",
+          padding:      "3px 10px",
           borderRadius: "999px",
-          border: "1px solid #c2d4f8",
+          border:       "1px solid #c2d4f8",
         }}
       >
         {getTimeAgo(date)}
       </span>
-
       {showTooltip && (
-        <div
-          style={{
-            position: "absolute",
-            bottom: "calc(100% + 6px)",
-            left: "50%",
-            transform: "translateX(-50%)",
-            background: "#1a1a1a",
-            color: "#fff",
-            padding: "5px 10px",
-            borderRadius: "6px",
-            fontSize: "12px",
-            whiteSpace: "nowrap",
-            zIndex: 100,
-            pointerEvents: "none",
-          }}
-        >
+        <div style={{
+          position:    "absolute",
+          bottom:      "calc(100% + 6px)",
+          left:        "50%",
+          transform:   "translateX(-50%)",
+          background:  "#1a1a1a",
+          color:       "#fff",
+          padding:     "5px 10px",
+          borderRadius:"6px",
+          fontSize:    "12px",
+          whiteSpace:  "nowrap",
+          zIndex:      100,
+          pointerEvents: "none",
+        }}>
           {exact}
         </div>
       )}
@@ -420,189 +378,446 @@ function TimeAgo({ date }) {
   );
 }
 
-export default function Index() {
+// ── PIN Overlay Component ─────────────────────────────────────────────────────
+function PinOverlay({ shopId, onSuccess }) {
   const fetcher = useFetcher();
+  const [code, setCode]   = useState("");
+  const isLoading         = fetcher.state !== "idle";
+  const error             = fetcher.data?.error;
+
+  // --- Auto-submit on 4 digits ---
+  useEffect(() => {
+    if (code.length === 4) {
+      fetcher.submit(
+        { userId: code },
+        { method: "POST", action: "/app/login" }
+      );
+    }
+  }, [code]);
+
+  // --- Handle response ---
+  useEffect(() => {
+    if (fetcher.data?.success === true) {
+      sessionStorage.setItem("skuboo_session_id", fetcher.data.sessionId);
+      sessionStorage.setItem("skuboo_username",   fetcher.data.username);
+      sessionStorage.setItem("skuboo_role",       fetcher.data.role);
+      onSuccess({
+        sessionId: fetcher.data.sessionId,
+        username:  fetcher.data.username,
+        role:      fetcher.data.role,
+      });
+    } else if (fetcher.data?.success === false) {
+      setCode("");
+    }
+  }, [fetcher.data]);
+
+  function handleInput(e) {
+    const val = e.target.value.replace(/\D/g, "");
+    if (val.length <= 4) setCode(val);
+  }
+
+  return (
+    <div style={overlayStyles.backdrop}>
+      <div style={overlayStyles.card}>
+
+        {/* --- Logo / Title only — subtitle removed --- */}
+        <div style={overlayStyles.title}>SKU Boo</div>
+
+        {/* --- PIN Input — type password hides the digits --- */}
+        <div style={overlayStyles.inputWrapper}>
+          <input
+            type="password"
+            inputMode="numeric"
+            pattern="\d*"
+            maxLength={4}
+            value={code}
+            onChange={handleInput}
+            placeholder="····"
+            autoFocus
+            disabled={isLoading}
+            style={{
+              ...overlayStyles.input,
+              borderColor: error
+                ? "#d82c0d"
+                : code.length === 4
+                ? "#008060"
+                : "#e1e3e5",
+            }}
+          />
+        </div>
+
+        {/* --- Status messages only — dots removed --- */}
+        {isLoading && (
+          <div style={overlayStyles.status}>Checking...</div>
+        )}
+        {error && !isLoading && (
+          <div style={{ ...overlayStyles.status, color: "#d82c0d" }}>{error}</div>
+        )}
+        {!error && !isLoading && code.length === 0 && (
+          <div style={overlayStyles.status}>Enter your 4 digit access key</div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+// ── Main Index Component ──────────────────────────────────────────────────────
+export default function Index() {
+  const { shopId } = useLoaderData();
+
+  // --- Session state ---
+  const [skuSession, setSkuSession] = useState(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
+
+  // --- Check sessionStorage on mount ---
+  useEffect(() => {
+    const sessionId = sessionStorage.getItem("skuboo_session_id");
+    const username  = sessionStorage.getItem("skuboo_username");
+    const role      = sessionStorage.getItem("skuboo_role");
+
+    if (sessionId && username) {
+      setSkuSession({ sessionId, username, role });
+    }
+    setSessionChecked(true);
+  }, []);
+
+  // --- Handle successful PIN entry ---
+  function handleAuthSuccess({ sessionId, username, role }) {
+    setSkuSession({ sessionId, username, role });
+  }
+
+  // --- Handle sign out ---
+  function handleSignOut() {
+    sessionStorage.removeItem("skuboo_session_id");
+    sessionStorage.removeItem("skuboo_username");
+    sessionStorage.removeItem("skuboo_role");
+    setSkuSession(null);
+  }
+
+  const fetcher        = useFetcher();
   const refreshFetcher = useFetcher();
 
   const isRefreshing = refreshFetcher.state === "loading";
-  const refreshLog = () => refreshFetcher.load(REFRESH_ROUTE);
+  const refreshLog   = () => refreshFetcher.load(REFRESH_ROUTE);
 
-  const shopify = useAppBridge();
+  const shopify    = useAppBridge();
   const loaderData = useLoaderData();
   const refreshedData = refreshFetcher.data;
 
-  const recentSkus = refreshedData?.recentSkus ?? loaderData?.recentSkus ?? [];
-  const productMap = refreshedData?.productMap ?? loaderData?.productMap ?? {};
-  const loaderError = refreshedData?.loaderError ?? loaderData?.loaderError;
+  const recentSkus  = refreshedData?.recentSkus ?? loaderData?.recentSkus ?? [];
+  const productMap  = refreshedData?.productMap ?? loaderData?.productMap ?? {};
 
   const isLoading =
     ["loading", "submitting"].includes(fetcher.state) &&
     fetcher.formMethod === "POST";
 
-  const generateSku = () => fetcher.submit({ intent: "generate" }, { method: "POST" });
+  // --- If action returns needsAuth, session expired ---
+  useEffect(() => {
+    if (fetcher.data?.needsAuth || refreshFetcher.data?.needsAuth) {
+      handleSignOut();
+    }
+  }, [fetcher.data, refreshFetcher.data]);
+
+  const generateSku = () => {
+    if (!skuSession?.sessionId) return;
+    fetcher.submit(
+      { intent: "generate", sessionId: skuSession.sessionId },
+      { method: "POST" }
+    );
+  };
 
   const openProductEditor = (productId) => {
     shopify.intents.invoke?.("edit:shopify/Product", { value: productId });
   };
 
+  // --- Don't render until we've checked sessionStorage ---
+  if (!sessionChecked) return null;
+
   return (
-    <s-page heading="SKU Boo">
-      <s-section heading="SKU Generator">
-        <s-stack direction="inline" gap="base">
-          <s-button
-            onClick={generateSku}
-            {...(isLoading ? { loading: true } : {})}
-          >
-            Generate Next SKU
-          </s-button>
+    <>
+      {/* ── PIN Overlay — shown when not authenticated ── */}
+      {!skuSession && (
+        <PinOverlay shopId={shopId} onSuccess={handleAuthSuccess} />
+      )}
 
-          {fetcher.data?.productId && (
-            <s-button
-              onClick={() => openProductEditor(fetcher.data.productId)}
-              variant="primary"
-              tone="success"
-            >
-              ✏️ Edit Product
-            </s-button>
-          )}
-        </s-stack>
+      {/* ── Main App ── */}
+      <s-page heading="SKU Boo">
 
-        {fetcher.data?.sku && (
-          <s-box padding="small" background="success-subdued" borderRadius="base">
-            <s-paragraph>
-              ✓ Created SKU <strong>{fetcher.data.sku}</strong>
-            </s-paragraph>
-          </s-box>
+        {/* ── User Badge Top Left ── */}
+        {skuSession && (
+          <div style={userBadgeStyles.wrapper}>
+            <div style={userBadgeStyles.badge}>
+              <span style={userBadgeStyles.icon}>👤</span>
+              <span style={userBadgeStyles.name}>{skuSession.username}</span>
+              <button
+                onClick={handleSignOut}
+                style={userBadgeStyles.signOut}
+              >
+                Sign Out
+              </button>
+            </div>
+          </div>
         )}
 
-        {fetcher.data?.error && (
-          <s-box padding="small" background="critical-subdued" borderRadius="base">
-            <s-paragraph>Error: {fetcher.data.error}</s-paragraph>
-          </s-box>
-        )}
-
-        <s-box border="base" background="base" borderRadius="base" padding="base">
-          <s-stack direction="inline" justifyContent="space-between" alignItems="center" padding="small-300">
-            <s-heading>Recently Generated SKUs</s-heading>
+        <s-section heading="SKU Generator">
+          <s-stack direction="inline" gap="base">
             <s-button
-              variant="tertiary"
-              onClick={refreshLog}
-              {...(isRefreshing ? { loading: true } : {})}
+              onClick={generateSku}
+              {...(isLoading ? { loading: true } : {})}
             >
-              Refresh
+              Generate Next SKU
             </s-button>
+
+            {fetcher.data?.productId && (
+              <s-button
+                onClick={() => openProductEditor(fetcher.data.productId)}
+                variant="primary"
+                tone="success"
+              >
+                ✏️ Edit Product
+              </s-button>
+            )}
           </s-stack>
-          <div style={{ maxHeight: "75vh", overflowY: "auto" }}>
-            <s-table>
-              <s-table-header-row>
-                <s-table-header list-slot="primary">Product</s-table-header>
-                <s-table-header list-slot="labeled">Title</s-table-header>
-                <s-table-header list-slot="labeled">Date Created</s-table-header>
-                <s-table-header list-slot="inline">Actions</s-table-header>
-              </s-table-header-row>
 
-              <s-table-body>
-                {recentSkus.length === 0 && (
-                  <s-table-row>
-                    <s-table-cell>
-                      <s-paragraph>No SKUs generated yet.</s-paragraph>
-                    </s-table-cell>
-                  </s-table-row>
-                )}
+          {fetcher.data?.sku && (
+            <s-box padding="small" background="success-subdued" borderRadius="base">
+              <s-paragraph>
+                ✓ Created SKU <strong>{fetcher.data.sku}</strong>
+              </s-paragraph>
+            </s-box>
+          )}
 
-                {recentSkus.map((entry) => {
-                  const live = productMap?.[entry.productId];
-                  const displayTitle = live?.title ?? entry.title;
-                  const displayImage = live?.imageUrl ?? entry.imageUrl;
+          {fetcher.data?.error && (
+            <s-box padding="small" background="critical-subdued" borderRadius="base">
+              <s-paragraph>Error: {fetcher.data.error}</s-paragraph>
+            </s-box>
+          )}
 
-                  return (
-                    <s-table-row key={entry.id}>
+          <s-box border="base" background="base" borderRadius="base" padding="base">
+            <s-stack direction="inline" justifyContent="space-between" alignItems="center" padding="small-300">
+              <s-heading>Recently Generated SKUs</s-heading>
+              <s-button
+                variant="tertiary"
+                onClick={refreshLog}
+                {...(isRefreshing ? { loading: true } : {})}
+              >
+                Refresh
+              </s-button>
+            </s-stack>
+            <div style={{ maxHeight: "75vh", overflowY: "auto" }}>
+              <s-table>
+                <s-table-header-row>
+                  <s-table-header list-slot="primary">Product</s-table-header>
+                  <s-table-header list-slot="labeled">Title</s-table-header>
+                  <s-table-header list-slot="labeled">Date Created</s-table-header>
+                  <s-table-header list-slot="inline">Actions</s-table-header>
+                </s-table-header-row>
+
+                <s-table-body>
+                  {recentSkus.length === 0 && (
+                    <s-table-row>
                       <s-table-cell>
-                        <div style={{ width: "60px", height: "60px", flexShrink: 0 }}>
-                          {displayImage ? (
-                            <img
-                              src={displayImage}
-                              alt={displayTitle}
-                              style={{
-                                width: "60px",
-                                height: "60px",
-                                objectFit: "cover",
-                                borderRadius: "6px",
-                                display: "block",
-                              }}
-                            />
-                          ) : (
-                            <div
-                              style={{
-                                width: "60px",
-                                height: "60px",
-                                background: "#f1f1f1",
-                                borderRadius: "6px",
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                fontSize: "20px",
-                                color: "#999",
-                              }}
-                            >
-                              📦
-                            </div>
-                          )}
-                        </div>
-                      </s-table-cell>
-
-                      <s-table-cell>
-                        <s-box paddingBlock="small">
-                          <s-text type="strong">{displayTitle}</s-text>
-                        </s-box>
-                      </s-table-cell>
-
-                      <s-table-cell>
-                        <TimeAgo date={entry.createdAt} />
-                      </s-table-cell>
-
-                      <s-table-cell>
-                        <s-stack direction="inline" gap="small">
-                          <s-button
-                            variant="tertiary"
-                            onClick={() => openProductEditor(entry.productId)}
-                          >
-                            Edit
-                          </s-button>
-                          <s-button
-                            variant="tertiary"
-                            tone="critical"
-                            onClick={() => {
-                              const confirmed = window.confirm(
-                                `Delete SKU ${entry.sku}?\n\nThis will permanently remove the product from Shopify and the log. This cannot be undone.`
-                              );
-                              if (confirmed) {
-                                fetcher.submit(
-                                  {
-                                    intent: "delete",
-                                    productId: entry.productId,
-                                    skuLogId: String(entry.id),
-                                  },
-                                  { method: "POST" }
-                                );
-                              }
-                            }}
-                          >
-                            Delete
-                          </s-button>
-                        </s-stack>
+                        <s-paragraph>No SKUs generated yet.</s-paragraph>
                       </s-table-cell>
                     </s-table-row>
-                  );
-                })}
-              </s-table-body>
-            </s-table>
-          </div>
-        </s-box>
-      </s-section>
-    </s-page>
+                  )}
+
+                  {recentSkus.map((entry) => {
+                    const live         = productMap?.[entry.productId];
+                    const displayTitle = live?.title    ?? entry.title;
+                    const displayImage = live?.imageUrl ?? entry.imageUrl;
+
+                    return (
+                      <s-table-row key={entry.id}>
+                        <s-table-cell>
+                          <div style={{ width: "60px", height: "60px", flexShrink: 0 }}>
+                            {displayImage ? (
+                              <img
+                                src={displayImage}
+                                alt={displayTitle}
+                                style={{
+                                  width: "60px", height: "60px",
+                                  objectFit: "cover", borderRadius: "6px", display: "block",
+                                }}
+                              />
+                            ) : (
+                              <div style={{
+                                width: "60px", height: "60px",
+                                background: "#f1f1f1", borderRadius: "6px",
+                                display: "flex", alignItems: "center",
+                                justifyContent: "center", fontSize: "20px", color: "#999",
+                              }}>
+                                📦
+                              </div>
+                            )}
+                          </div>
+                        </s-table-cell>
+
+                        <s-table-cell>
+                          <s-box paddingBlock="small">
+                            <s-text type="strong">{displayTitle}</s-text>
+                          </s-box>
+                        </s-table-cell>
+
+                        <s-table-cell>
+                          <TimeAgo date={entry.createdAt} />
+                        </s-table-cell>
+
+                        <s-table-cell>
+                          <s-stack direction="inline" gap="small">
+                            <s-button
+                              variant="tertiary"
+                              onClick={() => openProductEditor(entry.productId)}
+                            >
+                              Edit
+                            </s-button>
+                            <s-button
+                              variant="tertiary"
+                              tone="critical"
+                              onClick={() => {
+                                const confirmed = window.confirm(
+                                  `Delete SKU ${entry.sku}?\n\nThis will permanently remove the product from Shopify and the log. This cannot be undone.`
+                                );
+                                if (confirmed) {
+                                  fetcher.submit(
+                                    {
+                                      intent:    "delete",
+                                      productId: entry.productId,
+                                      skuLogId:  String(entry.id),
+                                      sessionId: skuSession?.sessionId ?? "",
+                                    },
+                                    { method: "POST" }
+                                  );
+                                }
+                              }}
+                            >
+                              Delete
+                            </s-button>
+                          </s-stack>
+                        </s-table-cell>
+                      </s-table-row>
+                    );
+                  })}
+                </s-table-body>
+              </s-table>
+            </div>
+          </s-box>
+        </s-section>
+      </s-page>
+    </>
   );
 }
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+
+const overlayStyles = {
+  backdrop: {
+    position:        "fixed",
+    top:             0,
+    left:            0,
+    right:           0,
+    bottom:          0,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    display:         "flex",
+    alignItems:      "center",
+    justifyContent:  "center",
+    zIndex:          9999,
+  },
+  card: {
+    backgroundColor: "#ffffff",
+    borderRadius:    "12px",
+    padding:         "48px 40px",
+    boxShadow:       "0 2px 12px rgba(0,0,0,0.08)",
+    display:         "flex",
+    flexDirection:   "column",
+    alignItems:      "center",
+    gap:             "16px",
+    minWidth:        "320px",
+  },
+  title: {
+    fontSize:      "28px",
+    fontWeight:    "700",
+    color:         "#202223",
+    letterSpacing: "-0.5px",
+  },
+  subtitle: {
+    fontSize:  "14px",
+    color:     "#6d7175",
+    marginTop: "-8px",
+  },
+  inputWrapper: {
+    marginTop: "8px",
+    width:     "100%",
+  },
+  input: {
+    width:         "100%",
+    fontSize:      "32px",
+    fontWeight:    "600",
+    textAlign:     "center",
+    letterSpacing: "16px",
+    padding:       "16px",
+    border:        "2px solid",
+    borderRadius:  "8px",
+    outline:       "none",
+    transition:    "border-color 0.15s ease",
+    backgroundColor: "#f6f6f7",
+    boxSizing:     "border-box",
+    color:         "#202223",
+  },
+  dots: {
+    display:  "flex",
+    gap:      "12px",
+    marginTop:"4px",
+  },
+  dot: {
+    width:        "10px",
+    height:       "10px",
+    borderRadius: "50%",
+    transition:   "background-color 0.15s ease",
+  },
+  status: {
+    fontSize:  "13px",
+    color:     "#6d7175",
+    marginTop: "4px",
+    textAlign: "center",
+    minHeight: "20px",
+  },
+};
+
+const userBadgeStyles = {
+  wrapper: {
+    padding:      "8px 16px 0 16px",
+    display:      "flex",
+    alignItems:   "center",
+  },
+  badge: {
+    display:         "flex",
+    alignItems:      "center",
+    gap:             "8px",
+    backgroundColor: "#f1f1f1",
+    borderRadius:    "999px",
+    padding:         "4px 12px",
+    fontSize:        "13px",
+    color:           "#202223",
+  },
+  icon: {
+    fontSize: "14px",
+  },
+  name: {
+    fontWeight: "600",
+  },
+  signOut: {
+    background:   "none",
+    border:       "none",
+    color:        "#6d7175",
+    cursor:       "pointer",
+    fontSize:     "12px",
+    padding:      "0 0 0 4px",
+    borderLeft:   "1px solid #c9cccf",
+    marginLeft:   "4px",
+  },
+};
 
 export const headers = (headersArgs) => {
   return boundary.headers(headersArgs);
