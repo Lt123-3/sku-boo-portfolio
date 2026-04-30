@@ -6,6 +6,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import db from "../db.server";
 import { useFetcher, useLoaderData } from "react-router";
 import { useState, useEffect } from "react";
+import { requireAccess } from "../lib/access.server.js";
 
 import {
   METAFIELD_NAMESPACE,
@@ -21,7 +22,19 @@ import {
 // ── BACKEND ───────────────────────────────────────────────────────────────────
 
 export const loader = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+
+  console.log("[index loader] session.shop:", session.shop);
+  
+  
+  const accessResult = await requireAccess(request, session.shop);
+  console.log("[index loader] accessResult type:", accessResult instanceof Response ? "REDIRECT" : "USER DATA");
+    
+  console.log("[index loader] accessResult type:", accessResult instanceof Response ? "REDIRECT" : "USER DATA");
+  console.log("[index loader] accessResult:", JSON.stringify(accessResult));
+  
+  if (accessResult instanceof Response) return accessResult;
+  const { username, role } = accessResult;
 
   // --- Read recent SKU log from SQLite ---
   let recentSkus = [];
@@ -36,7 +49,7 @@ export const loader = async ({ request }) => {
   }
 
   if (recentSkus.length === 0) {
-    return { recentSkus: [], productMap: {} };
+    return { recentSkus: [], productMap: {}, username, role };
   }
 
   // --- Batch-fetch live product data from Shopify ---
@@ -79,11 +92,17 @@ export const loader = async ({ request }) => {
     console.error("[loader] Failed to fetch product nodes from Shopify:", err);
   }
 
-  return { recentSkus, productMap };
+  return { recentSkus, productMap, username, role };
 };
 
 export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  // --- Fix: destructure session alongside admin ---
+  const { admin, session } = await authenticate.admin(request);
+
+  // --- Check SKU Boo access key session ---
+  const accessResult = await requireAccess(request, session.shop);
+  if (accessResult instanceof Response) return accessResult;
+  const { username, role } = accessResult;
 
   const formData = await request.formData();
   const intent = formData.get("intent");
@@ -162,7 +181,7 @@ export const action = async ({ request }) => {
   }
 
   const shop = metafieldData.data.shop;
-  const shopId = shop.id;
+  const shopGid = shop.id;
 
   // --- Get primary location ---
   let locationId;
@@ -191,7 +210,7 @@ export const action = async ({ request }) => {
   const skuString = String(currentSku).padStart(6, "0");
   const titleString = `${currentSku} - `;
 
-  console.log("[action] Shop ID:", shopId);
+  console.log("[action] Shop GID:", shopGid);
   console.log("[action] Current SKU:", currentSku);
 
   // --- Create product ---
@@ -279,7 +298,7 @@ export const action = async ({ request }) => {
             {
               namespace: METAFIELD_NAMESPACE,
               key: METAFIELD_KEY,
-              ownerId: shopId,
+              ownerId: shopGid,
               type: "number_integer",
               value: String(currentSku + 1),
             },
@@ -334,7 +353,6 @@ export const action = async ({ request }) => {
 
 // ── FRONTEND ──────────────────────────────────────────────────────────────────
 
-// ── TimeAgo Component ─────────────────────────────────────────────────────────
 function getTimeAgo(date) {
   const seconds = Math.floor((Date.now() - new Date(date)) / 1000);
   if (seconds < 60) return `${seconds}s ago`;
@@ -429,8 +447,6 @@ export default function Index() {
 
   return (
     <s-page heading="SKU Boo">
-
-      {/* ── SKU Generator + Log ── */}
       <s-section heading="SKU Generator">
         <s-stack direction="inline" gap="base">
           <s-button
@@ -501,8 +517,6 @@ export default function Index() {
 
                   return (
                     <s-table-row key={entry.id}>
-
-                      {/* Col 1 — Image */}
                       <s-table-cell>
                         <div style={{ width: "60px", height: "60px", flexShrink: 0 }}>
                           {displayImage ? (
@@ -537,19 +551,16 @@ export default function Index() {
                         </div>
                       </s-table-cell>
 
-                      {/* Col 2+3 — Title */}
                       <s-table-cell>
                         <s-box paddingBlock="small">
                           <s-text type="strong">{displayTitle}</s-text>
                         </s-box>
                       </s-table-cell>
 
-                      {/* Col 4 — Time ago */}
                       <s-table-cell>
                         <TimeAgo date={entry.createdAt} />
                       </s-table-cell>
 
-                      {/* Col 5 — Actions */}
                       <s-table-cell>
                         <s-stack direction="inline" gap="small">
                           <s-button
@@ -581,7 +592,6 @@ export default function Index() {
                           </s-button>
                         </s-stack>
                       </s-table-cell>
-
                     </s-table-row>
                   );
                 })}
