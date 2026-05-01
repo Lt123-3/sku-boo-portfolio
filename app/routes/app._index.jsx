@@ -7,6 +7,7 @@ import prisma from "../db.server";
 import { useFetcher, useLoaderData } from "react-router";
 import { useState, useEffect } from "react";
 import { validateSkuSession, cleanExpiredSessions } from "../lib/access.server.js";
+import { runDripSync } from "../lib/sync.server.js";
 
 import {
   METAFIELD_NAMESPACE,
@@ -19,11 +20,19 @@ import {
   REFRESH_ROUTE,
 } from "../config.js";
 
+
+
+
 // ── BACKEND ───────────────────────────────────────────────────────────────────
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const shopId = session.shop;
+
+  //-- Run drip sync in background on page load/refresh
+  runDripSync(admin, shopId).catch((err) => {
+    console.error("[loader] Drip sync failed silently:", err);
+  });
 
   // --- Clean up expired sessions occasionally ---
   await cleanExpiredSessions();
