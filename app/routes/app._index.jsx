@@ -4,10 +4,10 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import prisma from "../db.server";
-import { useFetcher, useLoaderData } from "react-router";
+import { useFetcher, useLoaderData, useNavigate } from "react-router";
 import { useState, useEffect } from "react";
 import { validateSkuSession, cleanExpiredSessions } from "../lib/access.server.js";
-import { runDripSync } from "../lib/sync.server.js";
+import { runDripSync, startBackgroundCron } from "../lib/sync.server.js";
 
 import {
   METAFIELD_NAMESPACE,
@@ -29,9 +29,12 @@ export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const shopId = session.shop;
 
-  //-- Run drip sync in background on page load/refresh
+  // Waits 5 minutes before first run
+  startBackgroundCron(admin, shopId);
+
+  // --- Drip sync on every page load ---
   runDripSync(admin, shopId).catch((err) => {
-    console.error("[loader] Drip sync failed silently:", err);
+    console.error("[loader] Drip sync failed:", err);
   });
 
   // --- Clean up expired sessions occasionally ---
@@ -474,7 +477,8 @@ function PinOverlay({ shopId, onSuccess }) {
 // ── Main Index Component ──────────────────────────────────────────────────────
 export default function Index() {
   const { shopId } = useLoaderData();
-
+  const navigate = useNavigate();
+  
   // --- Session state ---
   const [skuSession, setSkuSession] = useState(null);
   const [sessionChecked, setSessionChecked] = useState(false);
@@ -490,6 +494,12 @@ export default function Index() {
     }
     setSessionChecked(true);
   }, []);
+  
+
+  // --- DEBUG: remove after fixing ---
+console.log("skuSession:", skuSession);
+console.log("role:", skuSession?.role);
+// --- END DEBUG ---
 
   // --- Handle successful PIN entry ---
   function handleAuthSuccess({ sessionId, username, role }) {
@@ -503,6 +513,17 @@ export default function Index() {
     sessionStorage.removeItem("skuboo_role");
     setSkuSession(null);
   }
+
+  // --- Navigate to admin page with session ---
+  function handleAdminNav() {
+  const sessionId = sessionStorage.getItem("skuboo_session_id");
+  console.log("handleAdminNav called, sessionId:", sessionId);
+  if (!sessionId) {
+    alert("Session expired. Please sign in again.");
+    return;
+  }
+  navigate(`/app/admin?sessionId=${sessionId}`);
+}
 
   const fetcher        = useFetcher();
   const refreshFetcher = useFetcher();
@@ -568,6 +589,27 @@ export default function Index() {
             </div>
           </div>
         )}
+
+        {/* ── Admin link — only visible to admins ── */}
+{skuSession?.role === "admin" && (
+  <div style={{ padding: "4px 16px 0 16px" }}>
+    <button
+      onClick={handleAdminNav}
+      style={{
+        background:   "none",
+        border:       "none",
+        color:        "#6d7175",
+        fontSize:     "11px",
+        cursor:       "pointer",
+        padding:      "0",
+        textDecoration: "underline",
+      }}
+    >
+      ⚙ Admin
+    </button>
+  </div>
+)}
+
 
         <s-section heading="SKU Generator">
           <s-stack direction="inline" gap="base">

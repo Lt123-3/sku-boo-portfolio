@@ -29,30 +29,35 @@ model Session {
   refreshTokenExpires DateTime?
 }
 
-
-
 model SkuLog {
-  id        Int      @id @default(autoincrement())
-  sku       String
-  productId String
-  title     String
-  imageUrl  String?
-  createdAt DateTime @default(now())
+  id              Int      @id @default(autoincrement())
+  sku             String
+  productId       String
+  title           String
+  imageUrl        String?
+  shopId          String?                              // which store
+  skuNumber       String?                              // mirrors SkuIndex.skuNumber
+  status          String?  @default("active")          // free | active | reserved | problem | deleted
+  warehouseStatus String?                              // reserved for future warehouse features
+  problems        String?                              // JSON array
+  createdBy       String?                              // userId of who generated it
+  createdAt       DateTime @default(now())
 }
 
 model SkuIndex {
   id              Int       @id @default(autoincrement())
-  shopId          String                                    // which store this SKU belongs to
+  shopId          String
   skuNumber       String    @unique
   taken           Boolean   @default(false)
   titleTaken      Boolean   @default(false)
   productId       String?
   title           String?
-  status          String    @default("free")               // free | active | reserved | problem | deleted
-  problems        String?                                  // JSON array e.g. '["no_title","no_pic"]'
-  warehouseStatus String?                                  // reserved for future warehouse features
-  reservedAt      DateTime?
-  reservedBy      String?                                  // access key of the user who reserved it
+  status          String    @default("free")           // free | active | reserved | problem | deleted
+  problems        String?                              // JSON array e.g. '["no_title","no_pic"]'
+  warehouseStatus String?                              // reserved for future warehouse features
+  reservedAt      DateTime?                            // stores Shopify product.createdAt on sync
+  reservedBy      String?                              // access key of the user who reserved it
+  syncedAt        DateTime?                            // when we last synced this row
   updatedAt       DateTime  @updatedAt
 
   @@index([shopId])
@@ -60,6 +65,20 @@ model SkuIndex {
   @@index([shopId, status])
   @@index([shopId, status, skuNumber])
   @@index([warehouseStatus])
+}
+
+model AccessKey {
+  id        Int      @id @default(autoincrement())
+  shopId    String
+  userId    String
+  username  String   @default("admin")
+  role      String   @default("operator")             // viewer | operator | admin
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@unique([shopId, userId])
+  @@index([shopId])
+  @@index([userId])
 }
 
 model SkuSession {
@@ -76,17 +95,61 @@ model SkuSession {
   @@index([shopId])
 }
 
-model AccessKey {
-  id        Int      @id @default(autoincrement())
-  shopId    String
-  userId    String
-  username  String   @default("Larry")                       // e.g. "Luke", "Bob", "Larry"
-  role      String   @default("operator")                // viewer | operator | admin
-  active    Boolean  @default(true)
-  createdAt DateTime @default(now())
+model ProductInfo {
+  id          Int      @id @default(autoincrement())
+  shopId      String
+  productId   String   @unique                        // one row per product, upserted on sync
+  skuNumber   String?
+  title       String?
+  vendor      String?
+  price       String?                                 // stored as string to preserve decimals
+  weight      String?                                 // stored as string with unit
+  condition   String?                                 // custom.ebay_condition_id metafield
+  inventory   String?                                 // JSON — {locationId: quantity}
+  collections String?                                 // JSON array of collection titles
+  imageUrl    String?
+  imageCount  Int?
+  notes       String?                                 // JSON append-only array of {userId, username, text, timestamp}
+  updatedAt   DateTime @updatedAt
+  syncedAt    DateTime?
 
-  @@unique([shopId, userId])
   @@index([shopId])
-  @@index([userId])
+  @@index([skuNumber])
+  @@index([shopId, skuNumber])
 }
 
+model SkuHistory {
+  id         Int      @id @default(autoincrement())
+  shopId     String
+  productId  String
+  skuNumber  String?
+  field      String                                   // title | price | vendor | weight | condition | inventory | collections | image
+  oldValue   String?
+  newValue   String?
+  changedAt  DateTime @default(now())
+  changedBy  String   @default("system")              // userId or "system"
+
+  @@index([shopId])
+  @@index([productId])
+  @@index([skuNumber])
+  @@index([shopId, productId])
+  @@index([field])
+  @@index([changedAt])
+}
+
+model SyncState {
+  id          Int       @id @default(autoincrement())
+  shopId      String    @unique
+  status      String    @default("idle")
+  currentPass Int?
+  processed   Int       @default(0)
+  total       Int       @default(0)
+  cursor      String?                    
+  startTime   DateTime?                  
+  lastCronRun DateTime?
+  lastError   String?
+  startedAt   DateTime?
+  completedAt DateTime?
+  updatedAt   DateTime  @updatedAt
+  eta         String?
+}

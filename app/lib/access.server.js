@@ -2,7 +2,6 @@
 
 import prisma from "../db.server.js";
 import crypto from "crypto";
-
 // --- Constants ---
 const SESSION_DURATION_MS = 8 * 60 * 60 * 1000; // 8 hours in milliseconds
 
