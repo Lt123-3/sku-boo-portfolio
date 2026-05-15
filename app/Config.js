@@ -31,9 +31,10 @@ export const ACCESS_ROLES = {
 }
 
 export const SKU_PROBLEMS = {
-  DUPLICATE_SKU: "duplicate_sku",
-  NO_SKU:        "no_sku",
-  NO_TITLE:      "no_title",
+  NO_SKU:        "no_sku",        // no valid 6-digit SKU
+  NO_TITLE:      "no_title",      // no title at all
+  NO_TITLE_SKU:  "no_title_sku",  // has title body but missing number prefix
+  NO_TITLE_BODY: "no_title_body", // has number prefix but no body (unused SKU?)
   NO_PIC:        "no_pic",
   NO_PREP:       "no_prep",
 }

@@ -1,89 +1,121 @@
 // app/lib/sync.server.js
 
 import prisma from "../db.server.js";
-import { SKU_STATUS, SKU_PROBLEMS } from "../config.js";
+import { SKU_STATUS, SKU_PROBLEMS } from "../Config.js";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const INIT_PAGE_SIZE     = 250;
-const CRON_PAGE_SIZE     = 75;
-const DRIP_PAGE_SIZE     = 25;
+const INIT_PAGE_SIZE = 100;
+const CRON_PAGE_SIZE = 75;
+const DRIP_PAGE_SIZE = 25;
 const SKU_REGEX          = /^\d{6}$/;
-const TITLE_PREFIX_REGEX = /^\d+ - .+/;
+const TITLE_SKU_REGEX    = /^\d+\s*[-–]\s*/;
+const TITLE_BODY_REGEX   = /^\d+\s*[-–]\s*.+/;
+const TITLE_PREFIX_REGEX = TITLE_BODY_REGEX;
+
+// ── Speed settings ────────────────────────────────────────────────────────────
+export const SYNC_SPEEDS = {
+  slow:   2000,
+  medium: 800,
+  fast:   200,
+};
 
 // ── Tracked fields for change detection ───────────────────────────────────────
 const TRACKED_FIELDS = [
-  "title",
-  "vendor",
-  "price",
-  "weight",
-  "condition",
-  "inventory",
-  "collections",
-  "imageUrl",
+  "title", "vendor", "price", "weight",
+  "condition", "inventory", "collections", "imageUrl",
 ];
 
 // ── Rate limit helper ─────────────────────────────────────────────────────────
-// Reads the API cost from a GraphQL response and returns ms to wait
-function getThrottleDelay(responseData) {
+function getThrottleDelay(responseData, baseDelay) {
   const cost = responseData?.extensions?.cost;
-  if (!cost) return 500;
+  if (!cost) return baseDelay;
 
-  const available  = cost.throttleStatus?.currentlyAvailable ?? 1000;
-  const restore    = cost.throttleStatus?.restoreRate        ?? 50;
-  const queryCost  = cost.actualQueryCost                    ?? 50;
+  const available = cost.throttleStatus?.currentlyAvailable ?? 1000;
+  const restore   = cost.throttleStatus?.restoreRate        ?? 50;
+  const queryCost = cost.actualQueryCost                    ?? 50;
 
-  // --- If budget is running low, wait for it to refill ---
-  if (available < queryCost * 2) {
-    const neededPoints = (queryCost * 2) - available;
-    const waitMs       = Math.ceil((neededPoints / restore) * 1000) + 200;
+  if (available < queryCost * 3) {
+    const neededPoints = (queryCost * 3) - available;
+    const waitMs       = Math.ceil((neededPoints / restore) * 1000) + 500;
     console.log(`[sync] Rate limit low (${available} pts remaining), waiting ${waitMs}ms`);
     return waitMs;
   }
 
-  return 300;
+  return baseDelay;
 }
 
 // ── ETA helper ────────────────────────────────────────────────────────────────
 function formatEta(processed, total, startTime) {
   if (!startTime || processed === 0) return null;
-
   const elapsedMs     = Date.now() - new Date(startTime).getTime();
   const msPerProduct  = elapsedMs / processed;
   const remainingMs   = msPerProduct * (total - processed);
   const remainingMins = Math.ceil(remainingMs / 60000);
-
   if (remainingMins < 1)   return "less than a minute remaining";
   if (remainingMins === 1) return "~1 minute remaining";
   return `~${remainingMins} minutes remaining`;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
+// ── Problem detection ─────────────────────────────────────────────────────────
 function detectProblems(product, variant) {
   const problems = [];
-  const sku      = variant?.sku   ?? null;
-  const title    = product.title  ?? null;
+  const sku   = variant?.sku  ?? null;
+  const title = product.title ?? null;
 
-  if (!sku || !SKU_REGEX.test(sku))              problems.push(SKU_PROBLEMS.NO_SKU);
-  if (!title || !TITLE_PREFIX_REGEX.test(title)) problems.push(SKU_PROBLEMS.NO_TITLE);
-  if (!product.featuredImage)                    problems.push(SKU_PROBLEMS.NO_PIC);
+  if (!sku || !SKU_REGEX.test(sku)) problems.push(SKU_PROBLEMS.NO_SKU);
 
+  if (!title) {
+    problems.push(SKU_PROBLEMS.NO_TITLE);
+  } else {
+    const hasTitleSku  = TITLE_SKU_REGEX.test(title);
+    const hasTitleBody = TITLE_BODY_REGEX.test(title);
+    if (!hasTitleSku && !hasTitleBody) problems.push(SKU_PROBLEMS.NO_TITLE);
+    if (!hasTitleSku && hasTitleBody)  problems.push(SKU_PROBLEMS.NO_TITLE_SKU);
+    if (hasTitleSku  && !hasTitleBody) problems.push(SKU_PROBLEMS.NO_TITLE_BODY);
+  }
+
+  if (!product.featuredImage) problems.push(SKU_PROBLEMS.NO_PIC);
   return problems;
 }
 
+// ── Write ProblemLog entries for newly detected problems ──────────────────────
+async function writeProblemLogDetected(shopId, productId, skuNumber, newProblems, oldProblemsJson, excludedProblemsJson) {
+  const oldProblems      = JSON.parse(oldProblemsJson      ?? "[]");
+  const excludedProblems = JSON.parse(excludedProblemsJson ?? "[]");
+
+  // --- Only log problems that are genuinely new and not excluded ---
+  const trulyNew = newProblems.filter(
+    (p) => !oldProblems.includes(p) && !excludedProblems.includes(p)
+  );
+
+  if (trulyNew.length === 0) return;
+
+  try {
+    await prisma.problemLog.createMany({
+      data: trulyNew.map((problemType) => ({
+        shopId,
+        productId,
+        skuNumber:   skuNumber ?? null,
+        action:      "detected",
+        problemType,
+        changedBy:   "system",
+      })),
+    });
+  } catch (err) {
+    console.error("[writeProblemLogDetected] Failed:", err);
+  }
+}
+
+// ── Inventory helpers ─────────────────────────────────────────────────────────
 function buildInventoryJson(variant) {
   const levels    = variant?.inventoryItem?.inventoryLevels?.edges ?? [];
   const inventory = {};
-
   for (const edge of levels) {
     const locationId   = edge.node.location?.id;
     const locationName = edge.node.location?.name;
     const qty          = edge.node.quantities?.[0]?.quantity ?? 0;
-    if (locationId) {
-      inventory[locationId] = { name: locationName, quantity: qty };
-    }
+    if (locationId) inventory[locationId] = { name: locationName, quantity: qty };
   }
-
   return JSON.stringify(inventory);
 }
 
@@ -93,19 +125,29 @@ function extractWeight(variant) {
   return `${weightData.value} ${weightData.unit ?? ""}`.trim();
 }
 
+// ── Check if sync was cancelled ───────────────────────────────────────────────
+async function isCancelled(shopId) {
+  try {
+    const state = await prisma.syncState.findUnique({ where: { shopId } });
+    return state?.status === "cancelled";
+  } catch {
+    return false;
+  }
+}
+
 // ── Upsert SkuIndex row ───────────────────────────────────────────────────────
 export async function upsertSkuIndexRow(product, shopId) {
   const variant   = product.variants?.edges?.[0]?.node;
   const sku       = variant?.sku ?? null;
   const title     = product.title ?? null;
-  const problems  = detectProblems(product, variant);
-  const status    = problems.length > 0 ? SKU_STATUS.PROBLEM : SKU_STATUS.ACTIVE;
+  const rawProblems = detectProblems(product, variant);
   const skuNumber = (sku && SKU_REGEX.test(sku)) ? sku : null;
 
-  // --- Products with no valid SKU get a GID-based placeholder ---
   if (!skuNumber) {
     const placeholderKey = `gid-${product.id.replace(/\//g, "-")}`;
     try {
+      const existing = await prisma.skuIndex.findUnique({ where: { skuNumber: placeholderKey } });
+
       await prisma.skuIndex.upsert({
         where:  { skuNumber: placeholderKey },
         update: {
@@ -127,6 +169,13 @@ export async function upsertSkuIndexRow(product, shopId) {
           syncedAt:   new Date(),
         },
       });
+
+      await writeProblemLogDetected(
+        shopId, product.id, null,
+        [SKU_PROBLEMS.NO_SKU],
+        existing?.problems ?? "[]",
+        existing?.excludedProblems ?? "[]"
+      );
     } catch (err) {
       console.error("[upsertSkuIndexRow] Failed no-sku product:", product.id, err);
     }
@@ -134,11 +183,18 @@ export async function upsertSkuIndexRow(product, shopId) {
   }
 
   try {
+    const existing = await prisma.skuIndex.findUnique({ where: { skuNumber } });
+    const excluded = JSON.parse(existing?.excludedProblems ?? "[]");
+
+    // --- Filter out excluded problems before saving ---
+    const problems = rawProblems.filter((p) => !excluded.includes(p));
+    const status   = problems.length > 0 ? SKU_STATUS.PROBLEM : SKU_STATUS.ACTIVE;
+
     await prisma.skuIndex.upsert({
       where:  { skuNumber },
       update: {
         taken:      true,
-        titleTaken: title ? TITLE_PREFIX_REGEX.test(title) : false,
+        titleTaken: title ? TITLE_BODY_REGEX.test(title) : false,
         productId:  product.id,
         title,
         status,
@@ -158,6 +214,13 @@ export async function upsertSkuIndexRow(product, shopId) {
         syncedAt:   new Date(),
       },
     });
+
+    await writeProblemLogDetected(
+      shopId, product.id, skuNumber,
+      problems,
+      existing?.problems ?? "[]",
+      existing?.excludedProblems ?? "[]"
+    );
   } catch (err) {
     console.error("[upsertSkuIndexRow] Failed:", skuNumber, err);
   }
@@ -230,12 +293,9 @@ export async function detectAndWriteChanges(product, shopId) {
   const newValues = {
     title:       product.title  ?? null,
     vendor:      product.vendor ?? null,
-    price,
-    weight,
-    condition,
+    price, weight, condition,
     inventory:   inventoryJson,
-    collections,
-    imageUrl,
+    collections, imageUrl,
   };
 
   let existing;
@@ -269,14 +329,8 @@ export async function detectAndWriteChanges(product, shopId) {
       try {
         await prisma.skuHistory.create({
           data: {
-            shopId,
-            productId: product.id,
-            skuNumber,
-            field,
-            oldValue:  oldStr,
-            newValue:  newStr,
-            changedAt,
-            changedBy: "system",
+            shopId, productId: product.id, skuNumber, field,
+            oldValue: oldStr, newValue: newStr, changedAt, changedBy: "system",
           },
         });
         console.log(`[detectAndWriteChanges] ${field} changed on ${product.id}`);
@@ -296,12 +350,19 @@ export async function handleProductDeleted(productId, shopId) {
     await prisma.skuIndex.update({
       where: { id: existing.id },
       data: {
-        status:     SKU_STATUS.DELETED,
-        taken:      false,
-        titleTaken: false,
-        productId:  null,
-        title:      null,
-        syncedAt:   new Date(),
+        status: SKU_STATUS.DELETED, taken: false, titleTaken: false,
+        productId: null, title: null, syncedAt: new Date(),
+      },
+    });
+
+    await prisma.problemLog.create({
+      data: {
+        shopId,
+        productId,
+        skuNumber:   existing.skuNumber ?? null,
+        action:      "deleted",
+        problemType: null,
+        changedBy:   "system",
       },
     });
 
@@ -311,7 +372,7 @@ export async function handleProductDeleted(productId, shopId) {
   }
 }
 
-// ── Drip sync — lightweight, runs on every page load ─────────────────────────
+// ── Drip sync ─────────────────────────────────────────────────────────────────
 export async function runDripSync(admin, shopId) {
   console.log("[dripSync] Starting drip cycle");
 
@@ -323,21 +384,9 @@ export async function runDripSync(admin, shopId) {
         products(first: $first, sortKey: UPDATED_AT, reverse: true) {
           edges {
             node {
-              id
-              title
-              status
-              createdAt
-              updatedAt
-              variants(first: 1) {
-                edges {
-                  node {
-                    sku
-                  }
-                }
-              }
-              featuredImage {
-                url
-              }
+              id title status createdAt updatedAt
+              variants(first: 1) { edges { node { sku } } }
+              featuredImage { url }
             }
           }
         }
@@ -346,11 +395,7 @@ export async function runDripSync(admin, shopId) {
     );
 
     const data = await response.json();
-    if (data.errors) {
-      console.error("[dripSync] GraphQL errors:", data.errors);
-      return;
-    }
-
+    if (data.errors) { console.error("[dripSync] GraphQL errors:", data.errors); return; }
     products = data.data.products.edges.map((e) => e.node);
   } catch (err) {
     console.error("[dripSync] Failed to fetch:", err);
@@ -364,107 +409,22 @@ export async function runDripSync(admin, shopId) {
   console.log("[dripSync] Complete. Processed:", products.length);
 }
 
-// ── Background cron — every 5 minutes ────────────────────────────────────────
-let cronTimer = null;
+// ── Background cron ───────────────────────────────────────────────────────────
+let cronTimer  = null;
+let cronAdmin  = null;
+let cronShopId = null;
 
 export function startBackgroundCron(admin, shopId) {
+  cronAdmin  = admin;
+  cronShopId = shopId;
+
   if (cronTimer) return;
 
   console.log("[cron] Background cron scheduled — first run in 5 minutes");
 
   cronTimer = setInterval(async () => {
-    console.log("[cron] Starting cron cycle");
-
-    let products = [];
-    try {
-      const response = await admin.graphql(
-        `#graphql
-        query getCronProducts($first: Int!) {
-          products(first: $first, sortKey: UPDATED_AT, reverse: true) {
-            edges {
-              node {
-                id
-                title
-                vendor
-                updatedAt
-                media(first: 10) {
-                  edges {
-                    node {
-                      ... on MediaImage {
-                        image {
-                          url
-                        }
-                      }
-                    }
-                  }
-                }
-                collections(first: 20) {
-                  edges {
-                    node {
-                      title
-                    }
-                  }
-                }
-                metafield(namespace: "custom", key: "ebay_condition_id") {
-                  value
-                }
-                variants(first: 1) {
-                  edges {
-                    node {
-                      price
-                      sku
-                      inventoryItem {
-                        measurement {
-                          weight {
-                            value
-                            unit
-                          }
-                        }
-                        inventoryLevels(first: 10) {
-                          edges {
-                            node {
-                              location {
-                                id
-                                name
-                              }
-                              quantities(names: ["available"]) {
-                                quantity
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }`,
-        { variables: { first: CRON_PAGE_SIZE } }
-      );
-
-      const data = await response.json();
-      if (data.errors) {
-        console.error("[cron] GraphQL errors:", data.errors);
-        return;
-      }
-
-      products = data.data.products.edges.map((e) => e.node);
-    } catch (err) {
-      console.error("[cron] Failed to fetch:", err);
-      return;
-    }
-
-    for (const product of products) {
-      await detectAndWriteChanges(product, shopId);
-      await upsertSkuIndexRow(product, shopId);
-      await upsertProductInfoRow(product, shopId);
-    }
-
-    console.log("[cron] Cycle complete. Processed:", products.length);
-    await updateSyncState(shopId, { lastCronRun: new Date() });
-
+    if (!cronAdmin || !cronShopId) return;
+    await runCronCycle(cronAdmin, cronShopId);
   }, 5 * 60 * 1000);
 }
 
@@ -476,67 +436,34 @@ export function stopBackgroundCron() {
   }
 }
 
-// ── Force cron — runs immediately and resets the timer ────────────────────────
-export async function forceCronRun(admin, shopId) {
-  console.log("[cron] Force run triggered");
-
-  stopBackgroundCron();
+async function runCronCycle(admin, shopId) {
+  console.log("[cron] Starting cron cycle");
 
   let products = [];
   try {
     const response = await admin.graphql(
       `#graphql
-      query getForceCronProducts($first: Int!) {
+      query getCronProducts($first: Int!) {
         products(first: $first, sortKey: UPDATED_AT, reverse: true) {
           edges {
             node {
-              id
-              title
-              vendor
-              updatedAt
+              id title vendor updatedAt
               media(first: 10) {
-                edges {
-                  node {
-                    ... on MediaImage {
-                      image {
-                        url
-                      }
-                    }
-                  }
-                }
+                edges { node { ... on MediaImage { image { url } } } }
               }
-              collections(first: 20) {
-                edges {
-                  node {
-                    title
-                  }
-                }
-              }
-              metafield(namespace: "custom", key: "ebay_condition_id") {
-                value
-              }
+              collections(first: 20) { edges { node { title } } }
+              metafield(namespace: "custom", key: "ebay_condition_id") { value }
               variants(first: 1) {
                 edges {
                   node {
-                    price
-                    sku
+                    price sku
                     inventoryItem {
-                      measurement {
-                        weight {
-                          value
-                          unit
-                        }
-                      }
+                      measurement { weight { value unit } }
                       inventoryLevels(first: 10) {
                         edges {
                           node {
-                            location {
-                              id
-                              name
-                            }
-                            quantities(names: ["available"]) {
-                              quantity
-                            }
+                            location { id name }
+                            quantities(names: ["available"]) { quantity }
                           }
                         }
                       }
@@ -552,37 +479,42 @@ export async function forceCronRun(admin, shopId) {
     );
 
     const data = await response.json();
-    if (data.errors) {
-      console.error("[cron] Force run GraphQL errors:", data.errors);
-    } else {
-      products = data.data.products.edges.map((e) => e.node);
-      for (const product of products) {
-        await detectAndWriteChanges(product, shopId);
-        await upsertSkuIndexRow(product, shopId);
-        await upsertProductInfoRow(product, shopId);
-      }
-      console.log("[cron] Force run complete. Processed:", products.length);
-      await updateSyncState(shopId, { lastCronRun: new Date() });
-    }
+    if (data.errors) { console.error("[cron] GraphQL errors:", data.errors); return; }
+    products = data.data.products.edges.map((e) => e.node);
   } catch (err) {
-    console.error("[cron] Force run failed:", err);
+    console.error("[cron] Failed to fetch:", err);
+    return;
   }
 
+  for (const product of products) {
+    await detectAndWriteChanges(product, shopId);
+    await upsertSkuIndexRow(product, shopId);
+    await upsertProductInfoRow(product, shopId);
+  }
+
+  console.log("[cron] Cycle complete. Processed:", products.length);
+  await updateSyncState(shopId, { lastCronRun: new Date() });
+}
+
+// ── Force cron ────────────────────────────────────────────────────────────────
+export async function forceCronRun(admin, shopId) {
+  console.log("[cron] Force run triggered");
+  stopBackgroundCron();
+  await runCronCycle(admin, shopId);
   startBackgroundCron(admin, shopId);
 }
 
-// ── Init sync Pass 1 — SkuIndex population ────────────────────────────────────
-export async function runInitSyncPass1(admin, shopId, resumeCursor = null) {
-  console.log("[initSync Pass 1] Starting for shop:", shopId, resumeCursor ? "RESUMING" : "FRESH");
-
-  // --- Get total product count for progress + ETA ---
+// ── Init sync Pass 1 ──────────────────────────────────────────────────────────
+export async function runInitSyncPass1(admin, shopId, resumeCursor = null, speed = "medium") {
+  const baseDelay     = SYNC_SPEEDS[speed] ?? SYNC_SPEEDS.medium;
   const totalProducts = await getProductsCount(admin);
 
-  // --- Record start time for ETA calculation ---
+  console.log(`[initSync Pass 1] Starting — speed: ${speed} (${baseDelay}ms), ${resumeCursor ? "RESUMING" : "FRESH"}`);
+
   await updateSyncState(shopId, {
     status:      "running",
     currentPass: 1,
-    processed:   0,
+    processed:   resumeCursor ? null : 0,
     total:       totalProducts,
     startTime:   new Date(),
     lastError:   null,
@@ -594,33 +526,24 @@ export async function runInitSyncPass1(admin, shopId, resumeCursor = null) {
   let total   = 0;
 
   while (hasMore) {
+    if (await isCancelled(shopId)) {
+      console.log("[initSync Pass 1] Cancelled by user");
+      await updateSyncState(shopId, { status: "cancelled" });
+      return total;
+    }
+
     let response;
     try {
       response = await admin.graphql(
         `#graphql
         query getProductsPass1($first: Int!, $after: String) {
           products(first: $first, after: $after) {
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
+            pageInfo { hasNextPage endCursor }
             edges {
               node {
-                id
-                title
-                status
-                createdAt
-                updatedAt
-                variants(first: 1) {
-                  edges {
-                    node {
-                      sku
-                    }
-                  }
-                }
-                featuredImage {
-                  url
-                }
+                id title status createdAt updatedAt
+                variants(first: 1) { edges { node { sku } } }
+                featuredImage { url }
               }
             }
           }
@@ -629,23 +552,14 @@ export async function runInitSyncPass1(admin, shopId, resumeCursor = null) {
       );
     } catch (err) {
       console.error("[initSync Pass 1] Fetch failed:", err);
-      await updateSyncState(shopId, {
-        status:    "error",
-        cursor,
-        lastError: err.message,
-      });
-      break;
+      await updateSyncState(shopId, { status: "error", cursor, lastError: err.message });
+      return total;
     }
 
     const data = await response.json();
     if (data.errors) {
-      console.error("[initSync Pass 1] GraphQL errors:", data.errors);
-      await updateSyncState(shopId, {
-        status:    "error",
-        cursor,
-        lastError: data.errors[0]?.message ?? "GraphQL error",
-      });
-      break;
+      await updateSyncState(shopId, { status: "error", cursor, lastError: data.errors[0]?.message ?? "GraphQL error" });
+      return total;
     }
 
     const page     = data.data.products;
@@ -659,46 +573,36 @@ export async function runInitSyncPass1(admin, shopId, resumeCursor = null) {
     hasMore  = page.pageInfo.hasNextPage;
     cursor   = page.pageInfo.endCursor;
 
-    // --- Read startTime for ETA ---
     const syncState = await getSyncState(shopId);
     const eta       = formatEta(total, totalProducts, syncState?.startTime);
 
     console.log(`[initSync Pass 1] ${total} / ${totalProducts} — ${eta ?? "calculating..."}`);
 
-    // --- Save progress, cursor, and ETA after every page ---
     await updateSyncState(shopId, {
-      status:      "running",
-      currentPass: 1,
-      processed:   total,
-      total:       totalProducts,
-      cursor,
-      eta:         eta ?? null,
+      status: "running", currentPass: 1, processed: total,
+      total: totalProducts, cursor, eta: eta ?? null,
     });
 
-    // --- Respect rate limits ---
-    const delay = getThrottleDelay(data);
+    const delay = getThrottleDelay(data, baseDelay);
     await new Promise((resolve) => setTimeout(resolve, delay));
   }
 
-  // --- Clear cursor on clean completion ---
-  if (!hasMore) {
-    await updateSyncState(shopId, { cursor: null });
-  }
-
+  if (!hasMore) await updateSyncState(shopId, { cursor: null });
   console.log("[initSync Pass 1] Complete. Total:", total);
   return total;
 }
 
-// ── Init sync Pass 2 — ProductInfo population ─────────────────────────────────
-export async function runInitSyncPass2(admin, shopId, resumeCursor = null) {
-  console.log("[initSync Pass 2] Starting for shop:", shopId, resumeCursor ? "RESUMING" : "FRESH");
+// ── Init sync Pass 2 ──────────────────────────────────────────────────────────
+export async function runInitSyncPass2(admin, shopId, resumeCursor = null, speed = "medium") {
+  const baseDelay     = SYNC_SPEEDS[speed] ?? SYNC_SPEEDS.medium;
+  const totalProducts = await prisma.skuIndex.count({ where: { shopId } });
 
-  const totalProducts = await getProductsCount(admin);
+  console.log(`[initSync Pass 2] Starting — speed: ${speed} (${baseDelay}ms), ${resumeCursor ? "RESUMING" : "FRESH"}`);
 
   await updateSyncState(shopId, {
     status:      "running",
     currentPass: 2,
-    processed:   0,
+    processed:   resumeCursor ? null : 0,
     total:       totalProducts,
     startTime:   new Date(),
     lastError:   null,
@@ -710,65 +614,38 @@ export async function runInitSyncPass2(admin, shopId, resumeCursor = null) {
   let total   = 0;
 
   while (hasMore) {
+    if (await isCancelled(shopId)) {
+      console.log("[initSync Pass 2] Cancelled by user");
+      await updateSyncState(shopId, { status: "cancelled" });
+      return total;
+    }
+
     let response;
     try {
       response = await admin.graphql(
         `#graphql
         query getProductsPass2($first: Int!, $after: String) {
           products(first: $first, after: $after) {
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
+            pageInfo { hasNextPage endCursor }
             edges {
               node {
-                id
-                title
-                vendor
-                updatedAt
+                id title vendor updatedAt
                 media(first: 10) {
-                  edges {
-                    node {
-                      ... on MediaImage {
-                        image {
-                          url
-                        }
-                      }
-                    }
-                  }
+                  edges { node { ... on MediaImage { image { url } } } }
                 }
-                collections(first: 20) {
-                  edges {
-                    node {
-                      title
-                    }
-                  }
-                }
-                metafield(namespace: "custom", key: "ebay_condition_id") {
-                  value
-                }
+                collections(first: 20) { edges { node { title } } }
+                metafield(namespace: "custom", key: "ebay_condition_id") { value }
                 variants(first: 1) {
                   edges {
                     node {
-                      price
-                      sku
+                      price sku
                       inventoryItem {
-                        measurement {
-                          weight {
-                            value
-                            unit
-                          }
-                        }
+                        measurement { weight { value unit } }
                         inventoryLevels(first: 10) {
                           edges {
                             node {
-                              location {
-                                id
-                                name
-                              }
-                              quantities(names: ["available"]) {
-                                quantity
-                              }
+                              location { id name }
+                              quantities(names: ["available"]) { quantity }
                             }
                           }
                         }
@@ -784,23 +661,14 @@ export async function runInitSyncPass2(admin, shopId, resumeCursor = null) {
       );
     } catch (err) {
       console.error("[initSync Pass 2] Fetch failed:", err);
-      await updateSyncState(shopId, {
-        status:    "error",
-        cursor,
-        lastError: err.message,
-      });
-      break;
+      await updateSyncState(shopId, { status: "error", cursor, lastError: err.message });
+      return total;
     }
 
     const data = await response.json();
     if (data.errors) {
-      console.error("[initSync Pass 2] GraphQL errors:", data.errors);
-      await updateSyncState(shopId, {
-        status:    "error",
-        cursor,
-        lastError: data.errors[0]?.message ?? "GraphQL error",
-      });
-      break;
+      await updateSyncState(shopId, { status: "error", cursor, lastError: data.errors[0]?.message ?? "GraphQL error" });
+      return total;
     }
 
     const page     = data.data.products;
@@ -820,35 +688,20 @@ export async function runInitSyncPass2(admin, shopId, resumeCursor = null) {
     console.log(`[initSync Pass 2] ${total} / ${totalProducts} — ${eta ?? "calculating..."}`);
 
     await updateSyncState(shopId, {
-      status:      "running",
-      currentPass: 2,
-      processed:   total,
-      total:       totalProducts,
-      cursor,
-      eta:         eta ?? null,
+      status: "running", currentPass: 2, processed: total,
+      total: totalProducts, cursor, eta: eta ?? null,
     });
 
-    const delay = getThrottleDelay(data);
+    const delay = getThrottleDelay(data, baseDelay);
     await new Promise((resolve) => setTimeout(resolve, delay));
   }
 
-  if (!hasMore) {
-    await updateSyncState(shopId, { cursor: null });
-  }
-
+  if (!hasMore) await updateSyncState(shopId, { cursor: null });
   console.log("[initSync Pass 2] Complete. Total:", total);
   return total;
 }
 
-// ── Full init sync — both passes sequentially ─────────────────────────────────
-export async function runFullInitSync(admin, shopId, resumeCursor = null) {
-  const pass1Total = await runInitSyncPass1(admin, shopId, resumeCursor);
-  const pass2Total = await runInitSyncPass2(admin, shopId, null);
-  return { pass1Total, pass2Total };
-}
-
 // ── Sync State Helpers ────────────────────────────────────────────────────────
-
 export async function getSyncState(shopId) {
   try {
     return await prisma.syncState.findUnique({ where: { shopId } });
@@ -872,13 +725,8 @@ export async function updateSyncState(shopId, data) {
 
 export async function getProductsCount(admin) {
   try {
-    const response = await admin.graphql(
-      `#graphql
-      query getProductsCount {
-        productsCount {
-          count
-        }
-      }`
+    const response = await admin.graphql(`#graphql
+      query getProductsCount { productsCount { count } }`
     );
     const data = await response.json();
     return data.data?.productsCount?.count ?? 0;

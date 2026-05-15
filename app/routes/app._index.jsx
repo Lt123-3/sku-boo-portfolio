@@ -18,7 +18,7 @@ import {
   PRODUCT_HANDLE_PREFIX,
   LOG_PAGE_SIZE,
   REFRESH_ROUTE,
-} from "../config.js";
+} from "../Config.js";
 
 
 

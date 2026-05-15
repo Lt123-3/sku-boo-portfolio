@@ -54,6 +54,7 @@ model SkuIndex {
   title           String?
   status          String    @default("free")           // free | active | reserved | problem | deleted
   problems        String?                              // JSON array e.g. '["no_title","no_pic"]'
+  excludedProblems String?                             // JSON array — problems permanently excluded from detection
   warehouseStatus String?                              // reserved for future warehouse features
   reservedAt      DateTime?                            // stores Shopify product.createdAt on sync
   reservedBy      String?                              // access key of the user who reserved it
@@ -152,4 +153,21 @@ model SyncState {
   completedAt DateTime?
   updatedAt   DateTime  @updatedAt
   eta         String?
+}
+
+model ProblemLog {
+  id          Int      @id @default(autoincrement())
+  shopId      String
+  productId   String
+  skuNumber   String?
+  action      String   // "detected" | "passed" | "excluded" | "resolved" | "deleted"
+  problemType String?  // "no_sku" | "no_title" | "no_title_body" | "no_pic" | "no_prep" | null
+  changedBy   String   @default("system")
+  note        String?
+  createdAt   DateTime @default(now())
+
+  @@index([shopId])
+  @@index([productId])
+  @@index([skuNumber])
+  @@index([shopId, createdAt])
 }
