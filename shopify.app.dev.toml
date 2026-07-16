@@ -2,7 +2,7 @@
 
 client_id = "REDACTED_SHOPIFY_CLIENT_ID"
 name = "SKU Boo Dev"
-application_url = "https://example.com"
+application_url = "https://dev.skuboo.com/app"
 embedded = true
 
 [build]
@@ -14,9 +14,14 @@ api_version = "2025-07"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_inventory,read_locations,read_products,write_products"
+scopes = "read_inventory,read_locations,read_products,write_products,write_inventory,write_files"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ ]
+redirect_urls = [
+  "https://dev.skuboo.com/auth/callback",
+  "https://dev.skuboo.com/auth/shopify/callback",
+  "https://dev.skuboo.com/api/auth/callback",
+  "https://dev.skuboo.com/api/auth"
+]

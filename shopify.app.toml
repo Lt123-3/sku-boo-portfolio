@@ -10,7 +10,7 @@ automatically_update_urls_on_dev = false
 api_version = "2026-07"
 
 [access_scopes]
-scopes = "write_products,read_products,read_locations,read_inventory"
+scopes = "write_products,read_products,read_locations,read_inventory,write_files"
 
 [auth]
 redirect_urls = [

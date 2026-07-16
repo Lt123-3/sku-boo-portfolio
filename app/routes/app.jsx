@@ -19,8 +19,7 @@ export default function App() {
       <s-app-nav>
         <s-link href="/app">Home</s-link>
         <s-link href="/app/prep">Prep</s-link>
-
-        
+        <s-link href="/app/prepb">Prep B</s-link>
       </s-app-nav>
       <Outlet />
     </AppProvider>

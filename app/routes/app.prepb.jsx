@@ -3,7 +3,7 @@
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { useRouteError, useLoaderData, useFetcher, useSearchParams } from "react-router";
-import { useState, useEffect, useRef, useMemo, forwardRef, useImperativeHandle } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 
@@ -17,8 +17,56 @@ function useDebounce(fn, delay = 500) {
     timer.current = setTimeout(() => fn(...args), delay);
   };
 }
-const PRODUCTS_COUNT = 50;
-const SEARCH_COUNT   = 10;
+const PRODUCTS_COUNT       = 50;
+const SEARCH_COUNT         = 10;
+const SUGGEST_PAGE_SIZE    = 250;
+const SUGGEST_AUTOLOAD_CAP = 2000;
+
+// Normalizes a StringConnection (productVendors/productTypes/productTags) into
+// the page shape usePaginatedSuggestions expects, whether it came from the
+// loader's initial fetch or the "suggest-more" action.
+function toSuggestionPage(conn) {
+  return {
+    nodes: conn?.nodes ?? [],
+    hasNextPage: conn?.pageInfo?.hasNextPage ?? false,
+    endCursor: conn?.pageInfo?.endCursor ?? null,
+  };
+}
+
+// Static GraphQL queries for the "suggest-more" action intent — one per
+// paginatable suggestion field, keyed by the field name the client sends.
+const SUGGESTION_FIELD_QUERIES = {
+  vendor: {
+    key: "productVendors",
+    query: `#graphql
+      query moreVendorSuggestions($first: Int!, $after: String) {
+        productVendors(first: $first, after: $after) {
+          nodes
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+  },
+  type: {
+    key: "productTypes",
+    query: `#graphql
+      query moreTypeSuggestions($first: Int!, $after: String) {
+        productTypes(first: $first, after: $after) {
+          nodes
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+  },
+  tag: {
+    key: "productTags",
+    query: `#graphql
+      query moreTagSuggestions($first: Int!, $after: String) {
+        productTags(first: $first, after: $after) {
+          nodes
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+  },
+};
 
 const EBAY_CONDITIONS = [
   { code: "1000", label: "New" },
@@ -79,23 +127,42 @@ function validatePrepFields({ title }) {
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 export const loader = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const url          = new URL(request.url);
   const collectionId = url.searchParams.get("collectionId");
+  const shop          = session.shop;
 
-  const colRes = await admin.graphql(
-    `#graphql
-    query getRecentCollections($first: Int!) {
-      collections(first: $first, sortKey: UPDATED_AT, reverse: true) {
-        edges { node { id title productsCount { count } } }
-      }
-    }`,
-    { variables: { first: RECENT_COUNT } }
-  );
+  const [colRes, suggestRes] = await Promise.all([
+    admin.graphql(
+      `#graphql
+      query getRecentCollections($first: Int!) {
+        collections(first: $first, sortKey: UPDATED_AT, reverse: true) {
+          edges { node { id title productsCount { count } } }
+        }
+      }`,
+      { variables: { first: RECENT_COUNT } }
+    ),
+    admin.graphql(
+      `#graphql
+      query getFieldSuggestions($first: Int!) {
+        productVendors(first: $first) { nodes pageInfo { hasNextPage endCursor } }
+        productTypes(first: $first) { nodes pageInfo { hasNextPage endCursor } }
+        productTags(first: $first) { nodes pageInfo { hasNextPage endCursor } }
+      }`,
+      { variables: { first: SUGGEST_PAGE_SIZE } }
+    ),
+  ]);
   const colData           = await colRes.json();
   const recentCollections = colData.data.collections.edges.map(e => e.node);
 
-  if (!collectionId) return { recentCollections, collection: null, products: [] };
+  const suggestData       = await suggestRes.json();
+  const vendorSuggestions = toSuggestionPage(suggestData.data?.productVendors);
+  const typeSuggestions   = toSuggestionPage(suggestData.data?.productTypes);
+  const tagSuggestions    = toSuggestionPage(suggestData.data?.productTags);
+
+  if (!collectionId) {
+    return { recentCollections, collection: null, products: [], vendorSuggestions, typeSuggestions, tagSuggestions, shop };
+  }
 
   const prodRes = await admin.graphql(
     `#graphql
@@ -105,7 +172,7 @@ export const loader = async ({ request }) => {
         products(first: $first) {
           edges {
             node {
-              id title vendor productType tags bodyHtml
+              id title vendor productType tags bodyHtml status
               category { id name }
               featuredImage { url }
               media(first: 20) {
@@ -121,17 +188,18 @@ export const loader = async ({ request }) => {
               variants(first: 10) {
                 edges {
                   node {
-                    id title price sku
+                    id title price sku barcode inventoryPolicy taxable
                     selectedOptions { name value }
                     inventoryQuantity
                     inventoryItem {
-                      id tracked
+                      id tracked requiresShipping
+                      unitCost { amount }
                       measurement { weight { value unit } }
                       inventoryLevels(first: 5) {
                         edges {
                           node {
                             location { id name }
-                            quantities(names: ["available"]) { quantity }
+                            quantities(names: ["on_hand"]) { quantity }
                           }
                         }
                       }
@@ -150,7 +218,7 @@ export const loader = async ({ request }) => {
   const collection = prodData.data.collection;
   const products   = collection?.products?.edges?.map(e => e.node) ?? [];
 
-  return { recentCollections, collection, products };
+  return { recentCollections, collection, products, vendorSuggestions, typeSuggestions, tagSuggestions, shop };
 };
 
 export const action = async ({ request }) => {
@@ -245,6 +313,23 @@ export const action = async ({ request }) => {
     }
   }
 
+  // ── Load more field suggestions (vendor / type / tag) ─────────────────────
+  if (intent === "suggest-more") {
+    const field = form.get("field") ?? "";
+    const after = form.get("after") || null;
+
+    const entry = SUGGESTION_FIELD_QUERIES[field];
+    if (!entry) return { suggestMoreError: "Unknown field." };
+
+    try {
+      const res  = await admin.graphql(entry.query, { variables: { first: SUGGEST_PAGE_SIZE, after } });
+      const data = await res.json();
+      return { suggestMore: { field, ...toSuggestionPage(data.data?.[entry.key]) } };
+    } catch (err) {
+      return { suggestMoreError: String(err) };
+    }
+  }
+
   // ── Stage image upload ────────────────────────────────────────────────────
   if (intent === "stage-image") {
     const file     = form.get("file");
@@ -265,7 +350,7 @@ export const action = async ({ request }) => {
             userErrors { field message }
           }
         }`,
-        { variables: { input: [{ filename, mimeType, resource: "IMAGE", fileSize }] } }
+        { variables: { input: [{ filename, mimeType, resource: "IMAGE", fileSize, httpMethod: "PUT" }] } }
       );
       const stageData = await stageRes.json();
       const errs = stageData.data?.stagedUploadsCreate?.userErrors ?? [];
@@ -274,14 +359,23 @@ export const action = async ({ request }) => {
       }
       const target = stageData.data.stagedUploadsCreate.stagedTargets[0];
 
-      // POST file to staged URL — explicit Blob so Content-Type header is set correctly
+      // This shop's staged uploads go to Google Cloud Storage via a V4
+      // query-string-signed URL (signature lives in target.url's query string,
+      // only the `host` header is signed, payload is unsigned) for a PUT
+      // request — not an S3-style POST policy. HTTP method is part of what's
+      // cryptographically signed, so this must match httpMethod above exactly.
       const fileBuffer = await file.arrayBuffer();
       const blob = new Blob([fileBuffer], { type: mimeType });
-      const uploadForm = new FormData();
-      for (const p of target.parameters) uploadForm.append(p.name, p.value);
-      uploadForm.append("file", blob, filename);
-      const uploadRes = await fetch(target.url, { method: "POST", body: uploadForm });
-      if (!uploadRes.ok) return { stageError: `Upload failed (${uploadRes.status}).` };
+      const paramMap = Object.fromEntries(target.parameters.map(p => [p.name, p.value]));
+      const uploadHeaders = {};
+      if (paramMap.content_type) uploadHeaders["Content-Type"] = paramMap.content_type;
+      const uploadRes = await fetch(target.url, { method: "PUT", headers: uploadHeaders, body: blob });
+      if (!uploadRes.ok) {
+        const bodyText = await uploadRes.text().catch(() => "");
+        const diag = `paramNames=[${Object.keys(paramMap).join(", ")}] declaredFileSize=${fileSize} actualBlobSize=${blob.size} url=${target.url}`;
+        console.error("[stage-image] upload to staged target failed", uploadRes.status, bodyText, diag);
+        return { stageError: `Upload failed (${uploadRes.status}): ${bodyText.slice(0, 400) || "no response body"} || DIAG: ${diag}` };
+      }
 
       return { stagedUrl: target.resourceUrl };
     } catch (err) {
@@ -295,6 +389,7 @@ export const action = async ({ request }) => {
     const title                  = form.get("title");
     const vendor                 = form.get("vendor");
     const productType            = form.get("productType") ?? "";
+    const status                 = form.get("status") ?? "ACTIVE";
     const tagsRaw                = form.get("tags") ?? "";
     const condition              = form.get("condition") ?? "";
     const categoryId             = form.get("categoryId") ?? "";
@@ -313,8 +408,8 @@ export const action = async ({ request }) => {
     const errors = validatePrepFields({ title });
     if (errors.length > 0) return { saved: false, errors };
 
-    // 1. productUpdate — title, vendor, type, tags, description only
-    const productInput = { id: productId, title, vendor, productType, tags, descriptionHtml };
+    // 1. productUpdate — title, vendor, type, tags, description, status only
+    const productInput = { id: productId, title, vendor, productType, tags, descriptionHtml, status };
 
     const pRes   = await admin.graphql(
       `#graphql
@@ -352,12 +447,16 @@ export const action = async ({ request }) => {
       ).catch(err => console.error("[prep] condition failed:", err));
     }
 
-    // 3. Variant prices (SKU is now managed via inventoryItemUpdate in step 4)
+    // 3. Variant price + barcode + inventory policy + taxable (SKU is managed via inventoryItemUpdate in step 4)
     const variantInputs = variants
-      .map(v => ({
-        id: v.id,
-        ...(v.price !== "" && v.price != null ? { price: v.price } : {}),
-      }))
+      .map(v => {
+        const input = { id: v.id };
+        if (v.price !== "" && v.price != null) input.price = v.price;
+        if (v.barcode != null) input.barcode = v.barcode;
+        if (v.inventoryPolicy) input.inventoryPolicy = v.inventoryPolicy;
+        if (typeof v.taxable === "boolean") input.taxable = v.taxable;
+        return input;
+      })
       .filter(v => Object.keys(v).length > 1); // skip if only id (nothing to update)
     if (variantInputs.length > 0) {
       try {
@@ -381,7 +480,7 @@ export const action = async ({ request }) => {
       }
     }
 
-    // 4. Per-variant SKU + weight + tracked + inventory qty
+    // 4. Per-variant SKU + weight + tracked + inventory qty + cost
     const invErrors = [];
     for (const v of variants) {
       if (!v.inventoryItemId) continue;
@@ -389,6 +488,8 @@ export const action = async ({ request }) => {
       if (v.sku != null) invInput.sku = v.sku;
       if (v.weightValue) invInput.measurement = { weight: { value: parseFloat(v.weightValue), unit: v.weightUnit || "GRAMS" } };
       if (typeof v.tracked === "boolean") invInput.tracked = v.tracked;
+      if (v.costPerItem !== "" && v.costPerItem != null) invInput.cost = v.costPerItem;
+      if (typeof v.requiresShipping === "boolean") invInput.requiresShipping = v.requiresShipping;
       if (Object.keys(invInput).length > 0) {
         try {
           const r    = await admin.graphql(
@@ -460,14 +561,24 @@ export const action = async ({ request }) => {
     }
 
     // 6. Images — add
+    let createdMedia = [];
     if (newImageUrls.length > 0) {
-      await admin.graphql(
-        `#graphql
-        mutation createMedia($productId: ID!, $media: [CreateMediaInput!]!) {
-          productCreateMedia(productId: $productId, media: $media) { userErrors { field message } }
-        }`,
-        { variables: { productId, media: newImageUrls.map(url => ({ originalSource: url, mediaContentType: "IMAGE" })) } }
-      ).catch(err => console.error("[prep] createMedia failed:", err));
+      try {
+        const mediaRes = await admin.graphql(
+          `#graphql
+          mutation createMedia($productId: ID!, $media: [CreateMediaInput!]!) {
+            productCreateMedia(productId: $productId, media: $media) {
+              media { id ... on MediaImage { image { url } } }
+              userErrors { field message }
+            }
+          }`,
+          { variables: { productId, media: newImageUrls.map(url => ({ originalSource: url, mediaContentType: "IMAGE" })) } }
+        );
+        const mediaData = await mediaRes.json();
+        createdMedia = mediaData.data?.productCreateMedia?.media ?? [];
+      } catch (err) {
+        console.error("[prep] createMedia failed:", err);
+      }
     }
 
     // 6. Images — reorder
@@ -481,7 +592,7 @@ export const action = async ({ request }) => {
       ).catch(err => console.error("[prep] reorderMedia failed:", err));
     }
 
-    return { saved: true };
+    return { saved: true, newMedia: createdMedia.map(m => ({ id: m.id, url: m.image?.url ?? null })) };
   }
 
   // ── Remove product from collection ───────────────────────────────────────
@@ -580,8 +691,11 @@ export const action = async ({ request }) => {
 };
 
 // ── TagEditor ─────────────────────────────────────────────────────────────────
-function TagEditor({ tags, onChange }) {
+function TagEditor({ tags, onChange, suggestions = [], hasNextPage = false, loading = false, onLoadMore }) {
   const [input, setInput] = useState("");
+  const [open, setOpen]   = useState(false);
+  const wrapRef           = useRef(null);
+  const suppressBlurAdd   = useRef(false);
 
   function add(raw) {
     const trimmed = raw.trim().replace(/,$/, "");
@@ -591,27 +705,161 @@ function TagEditor({ tags, onChange }) {
 
   function remove(tag) { onChange(tags.filter(t => t !== tag)); }
 
-  function handleKeyDown(e) {
-    if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(input); }
-    if (e.key === "Backspace" && input === "" && tags.length > 0) remove(tags[tags.length - 1]);
+  function selectSuggestion(tag) {
+    suppressBlurAdd.current = true;
+    add(tag);
+    setOpen(false);
   }
 
+  function handleKeyDown(e) {
+    if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(input); setOpen(false); }
+    if (e.key === "Backspace" && input === "" && tags.length > 0) remove(tags[tags.length - 1]);
+    if (e.key === "Escape") setOpen(false);
+  }
+
+  // Close suggestion panel on outside click
+  useEffect(() => {
+    if (!open) return;
+    function handle(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  const filtered = suggestions
+    .filter(s => !tags.includes(s))
+    .filter(s => !input.trim() || s.toLowerCase().includes(input.trim().toLowerCase()));
+
   return (
-    <div style={sx.bubbleBox}>
-      {tags.map(tag => (
-        <span key={tag} style={sx.tagBubble}>
-          {tag}
-          <button style={sx.bubbleX} onClick={() => remove(tag)}>×</button>
-        </span>
-      ))}
-      <input
-        style={sx.bubbleInput}
-        value={input}
-        onChange={e => setInput(e.target.value)}
-        onKeyDown={handleKeyDown}
-        onBlur={() => input.trim() && add(input)}
-        placeholder={tags.length === 0 ? "Add tag…" : ""}
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <div style={sx.bubbleBox}>
+        {tags.map(tag => (
+          <span key={tag} style={sx.tagBubble}>
+            {tag}
+            <button style={sx.bubbleX} onClick={() => remove(tag)}>×</button>
+          </span>
+        ))}
+        <input
+          aria-label="Add tag"
+          style={sx.bubbleInput}
+          value={input}
+          onChange={e => { setInput(e.currentTarget.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={handleKeyDown}
+          onBlur={() => {
+            if (suppressBlurAdd.current) { suppressBlurAdd.current = false; return; }
+            if (input.trim()) add(input);
+          }}
+          placeholder={tags.length === 0 ? "Add tag…" : ""}
+        />
+      </div>
+      {open && (filtered.length > 0 || hasNextPage || (input.trim() && !tags.includes(input.trim()))) && (
+        <div style={sx.dropdown}>
+          {input.trim() && !tags.includes(input.trim()) && (
+            <div style={{ ...sx.dropItemBtn, fontWeight: 600 }} onMouseDown={() => selectSuggestion(input.trim())}>
+              Add &quot;{input.trim()}&quot;
+            </div>
+          )}
+          {filtered.map(s => (
+            <div key={s} style={sx.dropItemBtn} onMouseDown={() => selectSuggestion(s)}>{s}</div>
+          ))}
+          {hasNextPage && (
+            <div
+              style={{ ...sx.dropItemBtn, ...sx.dropLoadMore, borderBottom: "none" }}
+              onMouseDown={e => { e.preventDefault(); onLoadMore?.(); }}
+            >
+              {loading ? "Loading…" : "Load more"}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── usePaginatedSuggestions — cursor-paginated, store-wide suggestion list ────
+// Shared at the Prep page level (like allSkus) rather than per-row: vendor/type/
+// tag values aren't per-product, so every row should see the same loaded pages.
+function usePaginatedSuggestions(field, initialPage) {
+  const fetcher = useFetcher();
+  const [state, setState] = useState({
+    nodes: initialPage.nodes,
+    hasNextPage: initialPage.hasNextPage,
+    endCursor: initialPage.endCursor,
+  });
+
+  useEffect(() => {
+    const result = fetcher.data?.suggestMore;
+    if (!result || result.field !== field) return;
+    setState(prev => ({
+      nodes: [...new Set([...prev.nodes, ...result.nodes])],
+      hasNextPage: result.hasNextPage,
+      endCursor: result.endCursor,
+    }));
+  }, [fetcher.data, field]);
+
+  function loadMore() {
+    if (!state.hasNextPage || fetcher.state !== "idle") return;
+    fetcher.submit({ intent: "suggest-more", field, after: state.endCursor ?? "" }, { method: "POST" });
+  }
+
+  // Auto-walk every page in the background (typing should be able to search
+  // the whole store, not just whatever's been manually loaded) up to a safety
+  // cap, past which "Load more" becomes a manual fallback for huge stores.
+  useEffect(() => {
+    if (!state.hasNextPage) return;
+    if (state.nodes.length >= SUGGEST_AUTOLOAD_CAP) return;
+    if (fetcher.state !== "idle") return;
+    loadMore();
+  }, [state.hasNextPage, state.nodes.length, fetcher.state]);
+
+  return { nodes: state.nodes, hasNextPage: state.hasNextPage, loading: fetcher.state !== "idle", loadMore };
+}
+
+// ── SuggestField — text field with a filtered, paginated suggestion dropdown ──
+function SuggestField({ label, value, onChange, suggestions = [], placeholder, hasNextPage = false, loading = false, onLoadMore }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handle(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  const filtered = suggestions
+    .filter(s => s !== value)
+    .filter(s => !value.trim() || s.toLowerCase().includes(value.trim().toLowerCase()));
+
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <s-text-field
+        label={label}
+        labelAccessibilityVisibility="exclusive"
+        value={value}
+        onInput={e => { onChange(e.currentTarget.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        placeholder={placeholder}
       />
+      {open && (filtered.length > 0 || hasNextPage) && (
+        <div style={sx.dropdown}>
+          {filtered.map(s => (
+            <div key={s} style={sx.dropItemBtn} onMouseDown={() => { onChange(s); setOpen(false); }}>{s}</div>
+          ))}
+          {hasNextPage && (
+            <div
+              style={{ ...sx.dropItemBtn, ...sx.dropLoadMore, borderBottom: "none" }}
+              onMouseDown={e => { e.preventDefault(); onLoadMore?.(); }}
+            >
+              {loading ? "Loading…" : "Load more"}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -848,13 +1096,28 @@ function CategoryEditor({ category, onChange }) {
     <div ref={panelRef} style={{ position: "relative" }}>
       {/* Read-only trigger */}
       <div style={{ position: "relative" }}>
-        <input
-          style={{ ...sx.input, paddingRight: category.id ? 28 : undefined, background: category.id ? "#f0f7f4" : "#fff", cursor: "pointer" }}
+        <s-text-field
+          label="Category"
+          labelAccessibilityVisibility="exclusive"
+          style={{ cursor: "pointer" }}
           value={category.name || ""}
           readOnly
           onClick={() => setOpen(v => !v)}
           placeholder="Select category…"
         />
+        {/* Shadow-DOM readonly fill/text can't be restyled directly — an opaque
+            cover hides both, then a custom dark text layer redraws the value
+            on top, decoupling text color from the background fix. */}
+        <div style={{ position: "absolute", inset: 0, background: "#fbfbfc", borderRadius: 6, pointerEvents: "none" }} />
+        {category.name && (
+          <div style={{
+            position: "absolute", inset: 0, display: "flex", alignItems: "center",
+            paddingLeft: 12, paddingRight: 32, fontSize: 13, color: "#202223",
+            pointerEvents: "none", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+          }}>
+            {category.name}
+          </div>
+        )}
         {category.id && (
           <button style={sx.inlineClearBtn} onMouseDown={clear}>×</button>
         )}
@@ -865,10 +1128,11 @@ function CategoryEditor({ category, onChange }) {
         <div style={sx.categoryPanel}>
           {/* Search input */}
           <div style={{ padding: "8px 8px 4px", borderBottom: "1px solid #f1f1f1" }}>
-            <input
-              style={sx.input}
+            <s-text-field
+              label="Search categories"
+              labelAccessibilityVisibility="exclusive"
               value={query}
-              onChange={handleQuery}
+              onInput={handleQuery}
               placeholder="Search categories…"
               autoFocus
             />
@@ -1190,40 +1454,63 @@ function initVariantEdits(product) {
       locationId:      firstLevel?.location?.id   ?? null,
       locationName:    firstLevel?.location?.name ?? null,
       inventoryItemId: invItem?.id ?? null,
+      barcode:          v.barcode ?? "",
+      inventoryPolicy:  v.inventoryPolicy ?? "DENY",
+      costPerItem:      invItem?.unitCost?.amount ?? "",
+      taxable:          v.taxable ?? true,
+      requiresShipping: invItem?.requiresShipping ?? true,
     };
   }
   return edits;
 }
 
 // ── ProductRow ────────────────────────────────────────────────────────────────
-const ProductRow = forwardRef(function ProductRow({ product, allSkus, collectionId, onRemoved, alwaysOpen = false, onDraftChanged }, ref) {
+function ProductRow({
+  product, shop, allSkus,
+  vendorSuggestions, vendorSuggestionsHasMore, vendorSuggestionsLoading, onLoadMoreVendors,
+  typeSuggestions, typeSuggestionsHasMore, typeSuggestionsLoading, onLoadMoreTypes,
+  tagSuggestions, tagSuggestionsHasMore, tagSuggestionsLoading, onLoadMoreTags,
+  collectionId, onRemoved, highlighted,
+}) {
+  const REMOVE_DELAY_MS = 3500;
   const fetcher       = useFetcher();
   const removeFetcher  = useFetcher();
   const removeTimerRef = useRef(null);
+  const removeIntervalRef = useRef(null);
   const [open, setOpen]             = useState(false);
   const [removed, setRemoved]       = useState(false);
   const [pendingRemove, setPending] = useState(false);
-  const savingRef  = useRef(null);
-  const stateRef   = useRef({});
+  const [secondsLeft, setSecondsLeft] = useState(Math.ceil(REMOVE_DELAY_MS / 1000));
+  const savingRef = useRef(null);
 
   useEffect(() => {
     if (removeFetcher.data?.removedFromCollection) { setRemoved(true); onRemoved?.(); }
   }, [removeFetcher.data]);
 
+  useEffect(() => () => clearInterval(removeIntervalRef.current), []);
+
   function handleRemove(e) {
     e.stopPropagation();
     setPending(true);
+    setSecondsLeft(Math.ceil(REMOVE_DELAY_MS / 1000));
+    const startedAt = Date.now();
+    removeIntervalRef.current = setInterval(() => {
+      const remaining = REMOVE_DELAY_MS - (Date.now() - startedAt);
+      setSecondsLeft(Math.max(0, Math.ceil(remaining / 1000)));
+    }, 200);
     removeTimerRef.current = setTimeout(() => {
+      clearInterval(removeIntervalRef.current);
       removeFetcher.submit(
         { intent: "remove-from-collection", collectionId, productId: product.id },
         { method: "POST" }
       );
-    }, 3500);
+    }, REMOVE_DELAY_MS);
   }
 
   function handleUndoRemove(e) {
     e.stopPropagation();
     clearTimeout(removeTimerRef.current);
+    clearInterval(removeIntervalRef.current);
     setPending(false);
   }
 
@@ -1234,6 +1521,7 @@ const ProductRow = forwardRef(function ProductRow({ product, allSkus, collection
     productType: product.productType      ?? "",
     condition:   product.metafield?.value ?? "",
     bodyHtml:    product.bodyHtml ?? "",
+    status:      product.status           ?? "ACTIVE",
   };
   const [productFields, setProductFields]         = useState({ ...initProductFields });
   const [baseProductFields, setBaseProductFields] = useState({ ...initProductFields });
@@ -1275,11 +1563,20 @@ const ProductRow = forwardRef(function ProductRow({ product, allSkus, collection
       setBaseCollections([...s.collections]);
       setBaseCategory({ ...s.category });
       setBaseVariantEdits(JSON.parse(JSON.stringify(s.variantEdits)));
-      originalImageIdsRef.current = images.filter(img => !img.isNew).map(img => img.id);
-      setImages(prev => prev.filter(img => !img.isNew));
+      // Replace each newly-uploaded placeholder with its real Shopify media
+      // (id + CDN url) instead of dropping it — the CDN url may briefly be
+      // null while Shopify's async processing finishes, so fall back to the
+      // local preview blob url until a real page load picks up the final one.
+      const newMedia = fetcher.data.newMedia ?? [];
+      let newMediaIdx = 0;
+      const reconciledImages = images.map(img => {
+        if (!img.isNew) return img;
+        const m = newMedia[newMediaIdx++];
+        return m ? { id: m.id, url: m.url ?? img.url, altText: img.altText, isNew: false } : img;
+      });
+      setImages(reconciledImages);
+      originalImageIdsRef.current = reconciledImages.map(img => img.id).filter(Boolean);
       savingRef.current = null;
-      sessionStorage.removeItem(`skuboo_draft_${product.id}`);
-      onDraftChanged?.(product.id, false);
     }
   }, [fetcher.data]);
 
@@ -1290,7 +1587,9 @@ const ProductRow = forwardRef(function ProductRow({ product, allSkus, collection
   const isCategoryDirty = category.id !== baseCategory.id;
   const isVariantsDirty = Object.entries(variantEdits).some(([id, e]) => {
     const b = baseVariantEdits[id];
-    return !b || e.sku !== b.sku || e.price !== b.price || e.weightValue !== b.weightValue || e.tracked !== b.tracked || e.inventoryQty !== b.inventoryQty;
+    return !b || e.sku !== b.sku || e.price !== b.price || e.weightValue !== b.weightValue || e.tracked !== b.tracked || e.inventoryQty !== b.inventoryQty
+      || e.barcode !== b.barcode || e.inventoryPolicy !== b.inventoryPolicy || e.costPerItem !== b.costPerItem || e.taxable !== b.taxable
+      || e.requiresShipping !== b.requiresShipping;
   });
   const removedImageIds    = originalImageIdsRef.current.filter(id => !images.find(img => img.id === id));
   const currentImageOrder  = images.filter(img => !img.isNew).map(img => img.id).join(",");
@@ -1314,11 +1613,15 @@ const ProductRow = forwardRef(function ProductRow({ product, allSkus, collection
     setVariantEdits(JSON.parse(JSON.stringify(baseVariantEdits)));
     setImages(parseImages());
     originalImageIdsRef.current = parseImages().map(img => img.id);
-    sessionStorage.removeItem(`skuboo_draft_${product.id}`);
-    onDraftChanged?.(product.id, false);
   }
 
   function handleSave() {
+    const sellingOutOfStock = Object.values(variantEdits).some(e => e.inventoryPolicy === "CONTINUE");
+    if (sellingOutOfStock) {
+      const confirmed = window.confirm("ARE YOU SURE YOU WANT TO SELL WHEN... OUT OF STOCK????");
+      if (!confirmed) return;
+    }
+
     const imageOrderIds = images.filter(img => !img.isNew).map(img => img.id);
     const newImageUrls  = images.filter(img => img.isNew).map(img => img.sourceUrl);
     const addedColIds   = collections.filter(c => !baseCollections.find(b => b.id === c.id)).map(c => c.id);
@@ -1339,6 +1642,7 @@ const ProductRow = forwardRef(function ProductRow({ product, allSkus, collection
         title:                    productFields.title,
         vendor:                   productFields.vendor,
         productType:              productFields.productType,
+        status:                   productFields.status,
         condition:                productFields.condition,
         bodyHtml:                 productFields.bodyHtml,
         tags:                     tags.join(","),
@@ -1355,50 +1659,6 @@ const ProductRow = forwardRef(function ProductRow({ product, allSkus, collection
       { method: "POST" }
     );
   }
-
-  // Update stateRef on every render (in render body, not in effect) so unmount cleanup
-  // always reads the latest state, including mid-keystroke changes.
-  stateRef.current = { productFields, tags, collections, category, variantEdits, images, isDirty };
-
-  // On mount: restore draft from sessionStorage if one exists
-  useEffect(() => {
-    if (!alwaysOpen) return;
-    try {
-      const raw = sessionStorage.getItem(`skuboo_draft_${product.id}`);
-      if (!raw) return;
-      const d = JSON.parse(raw);
-      if (d.productFields) setProductFields(d.productFields);
-      if (d.tags) setTags(d.tags);
-      if (d.collections) setCollections(d.collections);
-      if (d.category) setCategory(d.category);
-      if (d.variantEdits) setVariantEdits(d.variantEdits);
-      if (d.images) setImages(d.images);
-    } catch {}
-  }, []);
-
-  // On unmount: persist draft if dirty so navigating away doesn't lose changes
-  useEffect(() => {
-    return () => {
-      if (!stateRef.current.isDirty) return;
-      const { productFields, tags, collections, category, variantEdits, images } = stateRef.current;
-      try {
-        sessionStorage.setItem(`skuboo_draft_${product.id}`, JSON.stringify({
-          productFields, tags, collections, category, variantEdits,
-          // blob: URLs expire on unmount; persist sourceUrl for new uploads instead
-          images: images.map(img => ({ ...img, url: img.isNew ? img.sourceUrl : img.url })),
-        }));
-      } catch {}
-      onDraftChanged?.(product.id, true);
-    };
-  }, []);
-
-  useImperativeHandle(ref, () => ({
-    save: () => { if (!isSaving && isDirty) handleSave(); },
-    discard: () => { if (!isSaving && isDirty) handleDiscard(); },
-    isDirty,
-    isSaving,
-    saved,
-  }), [isDirty, isSaving, saved, handleSave, handleDiscard]);
 
   const variantList = product.variants?.edges?.map(e => e.node) ?? [];
 
@@ -1417,52 +1677,78 @@ const ProductRow = forwardRef(function ProductRow({ product, allSkus, collection
   if (removed) return null;
 
   return (
-    <div style={alwaysOpen ? {} : { borderBottom: "1px solid #e1e3e5" }}>
+    <div
+      id={`product-row-${product.id}`}
+      style={{
+        borderBottom: "1px solid #e1e3e5",
+        background: highlighted ? "#e3f1df" : "transparent",
+        transition: "background 0.6s ease",
+      }}
+    >
       {/* ── Row header ── */}
-      {!alwaysOpen && (
-        <div style={sx.rowHeader} onClick={() => setOpen(v => !v)}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, flex: 1, minWidth: 0 }}>
-            {product.featuredImage
-              ? <img src={product.featuredImage.url} alt="" style={sx.thumb} />
-              : <div style={sx.thumbEmpty}>📦</div>}
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: 14, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+      <div style={sx.rowHeader} onClick={() => setOpen(v => !v)}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flex: 1, minWidth: 0 }}>
+          {product.featuredImage
+            ? <img src={product.featuredImage.url} alt="" style={sx.thumb} />
+            : <div style={sx.thumbEmpty}>📦</div>}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+              <span style={{
+                ...(productFields.status === "ACTIVE" ? sx.statusBadgeActive :
+                    productFields.status === "DRAFT" ? sx.statusBadgeDraft :
+                    sx.statusBadgeUnlisted),
+                marginTop: 15,
+              }}>
+                {productFields.status === "ACTIVE" ? "Active" : productFields.status === "DRAFT" ? "Draft" : "Unlisted"}
+              </span>
+              <span style={{ fontWeight: 600, fontSize: 14, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                 {product.title}
-              </div>
-              <div style={{ fontSize: 12, color: "#6d7175", marginTop: 2 }}>{headerSubtext}</div>
+              </span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, marginTop: -18 }}>
+              {/* Invisible clone of the badge — matches its exact width so the subtext lines up under the title, not the badge */}
+              <span style={{
+                ...(productFields.status === "ACTIVE" ? sx.statusBadgeActive :
+                    productFields.status === "DRAFT" ? sx.statusBadgeDraft :
+                    sx.statusBadgeUnlisted),
+                visibility: "hidden",
+              }}>
+                {productFields.status === "ACTIVE" ? "Active" : productFields.status === "DRAFT" ? "Draft" : "Unlisted"}
+              </span>
+              <span style={{ fontSize: 12, color: "#6d7175" }}>{headerSubtext}</span>
             </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-            {pendingRemove ? (
-              <>
-                <span style={{ fontSize: 12, color: "#d82c0d" }}>Removing…</span>
-                <button
-                  style={{ fontSize: 12, fontWeight: 600, color: "#005bd3", background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}
-                  onClick={handleUndoRemove}
-                >Undo</button>
-              </>
-            ) : (
-              <>
-                {saved    && !isDirty  && <span style={sx.badgeSaved}>✓ Saved</span>}
-                {isDirty  && !isSaving && <span style={sx.badgeDirty}>Unsaved</span>}
-                {isSaving              && <span style={sx.badgeSaving}>Saving…</span>}
-                <span style={{ color: "#6d7175", fontSize: 14 }}>{open ? "▲" : "▼"}</span>
-                {collectionId && (
-                  <button
-                    style={{ background: "none", border: "none", cursor: "pointer", color: "#8c9196", fontSize: 18, lineHeight: 1, padding: "0 2px" }}
-                    onClick={handleRemove}
-                    title="Remove from collection"
-                  >×</button>
-                )}
-              </>
-            )}
-          </div>
         </div>
-      )}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+          {pendingRemove ? (
+            <>
+              <span style={{ fontSize: 12, color: "#d82c0d" }}>Removing in {secondsLeft}s…</span>
+              <button
+                style={{ fontSize: 12, fontWeight: 600, color: "#005bd3", background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}
+                onClick={handleUndoRemove}
+              >Undo</button>
+            </>
+          ) : (
+            <>
+              {saved    && !isDirty  && <span style={sx.badgeSaved}>✓ Saved</span>}
+              {isDirty  && !isSaving && <span style={sx.badgeDirty}>Unsaved</span>}
+              {isSaving              && <span style={sx.badgeSaving}>Saving…</span>}
+              <span style={{ color: "#6d7175", fontSize: 14 }}>{open ? "▲" : "▼"}</span>
+              {collectionId && (
+                <button
+                  style={{ background: "none", border: "none", cursor: "pointer", color: "#8c9196", fontSize: 18, lineHeight: 1, padding: "0 2px" }}
+                  onClick={handleRemove}
+                  title="Remove from collection"
+                >×</button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
 
       {/* ── Expanded body ── */}
-      {(open || alwaysOpen) && (
-        <div style={{ ...sx.expandBody, ...(alwaysOpen ? { borderTop: "none", background: "#fff" } : {}) }}>
+      {open && (
+        <div style={{ ...sx.expandBody, background: highlighted ? "#e3f1df" : sx.expandBody.background, transition: "background 0.6s ease" }}>
           {errors.length > 0 && (
             <div style={sx.errorBox}>{errors.map((e, i) => <div key={i}>• {e}</div>)}</div>
           )}
@@ -1473,14 +1759,273 @@ const ProductRow = forwardRef(function ProductRow({ product, allSkus, collection
             </div>
           )}
 
+          {/* ── Images ── */}
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 8 }}>
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: "#202223", marginBottom: 4, textAlign: "left" }}>Status</div>
+                <div style={{ width: 130 }}>
+                  <s-select
+                    label="Status"
+                    labelAccessibilityVisibility="exclusive"
+                    style={{ width: "100%" }}
+                    value={productFields.status}
+                    onChange={e => setField("status", e.currentTarget.value)}
+                  >
+                    <s-option value="ACTIVE">Active</s-option>
+                    <s-option value="DRAFT">Draft</s-option>
+                    <s-option value="UNLISTED">Unlisted</s-option>
+                  </s-select>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={handleDiscard}
+                  disabled={isSaving || !isDirty}
+                  style={{ ...sx.discardBtn, opacity: isSaving || !isDirty ? 0.4 : 1, cursor: isSaving || !isDirty ? "default" : "pointer" }}
+                >
+                  Discard
+                </button>
+                <button
+                  onClick={handleSave}
+                  disabled={isSaving || !isDirty}
+                  style={{ ...sx.saveBtn, opacity: isSaving || !isDirty ? 0.5 : 1, cursor: isSaving || !isDirty ? "default" : "pointer" }}
+                >
+                  {isSaving ? "Saving…" : "Save"}
+                </button>
+              </div>
+            </div>
+            <ImageManager images={images} onUpdate={setImages} />
+          </div>
+
+          {/* ── Open in new tab ── */}
+          <div style={{ marginBottom: 20 }}>
+            <a
+              href={`https://${shop}/admin/products/${product.id.split("/").pop()}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: "inline-block", fontSize: 13, fontWeight: 600, color: "#202223",
+                background: "#fff", border: "1px solid #c9cccf", borderRadius: 6,
+                padding: "8px 14px", textDecoration: "none",
+              }}
+            >
+              Open in new tab ↗
+            </a>
+          </div>
+
           {/* Title — full width, header-style */}
           <div style={{ marginBottom: 12 }}>
             <Field label="Title">
-              <input style={sx.titleInput} value={productFields.title} onChange={e => setField("title", e.target.value)} />
+              <s-text-field
+                label="Title"
+                labelAccessibilityVisibility="exclusive"
+                value={productFields.title}
+                onInput={e => setField("title", e.currentTarget.value)}
+              />
             </Field>
           </div>
 
-          {/* Description */}
+          {/* Two-column layout */}
+          <div style={{ ...sx.grid, marginBottom: 12, alignItems: "start" }}>
+            {/* Left column */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={sx.relatedFieldsBox}>
+                <Field label="Category">
+                  <CategoryEditor category={category} onChange={setCategory} />
+                </Field>
+                <Field label="Vendor">
+                  <SuggestField
+                    label="Vendor"
+                    value={productFields.vendor}
+                    onChange={v => setField("vendor", v)}
+                    suggestions={vendorSuggestions}
+                    hasNextPage={vendorSuggestionsHasMore}
+                    loading={vendorSuggestionsLoading}
+                    onLoadMore={onLoadMoreVendors}
+                  />
+                </Field>
+                <Field label="Condition">
+                  <s-select
+                    label="Condition"
+                    labelAccessibilityVisibility="exclusive"
+                    value={productFields.condition}
+                    onChange={e => setField("condition", e.currentTarget.value)}
+                  >
+                    <s-option value="">— Select condition —</s-option>
+                    {EBAY_CONDITIONS.map(c => (
+                      <s-option key={c.code} value={c.code}>{c.label}</s-option>
+                    ))}
+                  </s-select>
+                </Field>
+              </div>
+            </div>
+            {/* Right column */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <Field label="Type">
+                <SuggestField
+                  label="Type"
+                  value={productFields.productType}
+                  onChange={v => setField("productType", v)}
+                  suggestions={typeSuggestions}
+                  hasNextPage={typeSuggestionsHasMore}
+                  loading={typeSuggestionsLoading}
+                  onLoadMore={onLoadMoreTypes}
+                  placeholder="e.g. Clothing"
+                />
+              </Field>
+              <Field label="Tags">
+                <TagEditor
+                  tags={tags}
+                  onChange={setTags}
+                  suggestions={tagSuggestions}
+                  hasNextPage={tagSuggestionsHasMore}
+                  loading={tagSuggestionsLoading}
+                  onLoadMore={onLoadMoreTags}
+                />
+              </Field>
+            </div>
+          </div>
+
+          {/* ── Primary fields (most-used — checked every time) — no table header, each field carries its own label ── */}
+          <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", marginBottom: 16 }}>
+            {variantList.map((v, idx) => {
+              const edit = variantEdits[v.id] ?? {};
+              // SKU duplicate: typed SKU exists in the collection's loaded SKUs (and isn't the original SKU for this variant)
+              const skuDupe = edit.sku && edit.sku !== (v.sku ?? "") && allSkus.has(edit.sku);
+              return (
+                <div key={v.id} style={{ ...sx.variantRow5col, borderBottom: idx < variantList.length - 1 ? "1px solid #f1f1f1" : "none" }}>
+                  {/* SKU */}
+                  <div style={{ display: "flex", justifyContent: "center" }}>
+                    <div style={{ width: `${Math.min(220, Math.max(48, Math.max((edit.sku ?? "").length, (edit.barcode ?? "").length) * 8 + 26))}px` }}>
+                      <s-text-field
+                        label="SKU"
+                        error={skuDupe ? "SKU already in use" : undefined}
+                        value={edit.sku ?? ""}
+                        onInput={e => setVariant(v.id, "sku", e.currentTarget.value)}
+                        placeholder="—"
+                      />
+                    </div>
+                  </div>
+                  {/* Price */}
+                  <div style={{ display: "flex", justifyContent: "center", maxWidth: 110, margin: "0 auto" }}>
+                    <s-number-field
+                      label="Price"
+                      style={{ width: 110, maxWidth: 110, minWidth: 0, boxSizing: "border-box", flex: "0 0 auto" }}
+                      prefix="$"
+                      step="0.01"
+                      min="0"
+                      value={edit.price ?? ""}
+                      onInput={e => setVariant(v.id, "price", e.currentTarget.value)}
+                    />
+                  </div>
+                  {/* Weight */}
+                  <div style={{ display: "flex", justifyContent: "flex-end", maxWidth: 90, margin: 0, marginLeft: "auto" }}>
+                    <s-number-field
+                      label="Weight"
+                      style={{ width: 90, maxWidth: 90, minWidth: 0, boxSizing: "border-box", flex: "0 0 auto" }}
+                      step="0.01"
+                      min="0"
+                      value={edit.weightValue ?? ""}
+                      onInput={e => setVariant(v.id, "weightValue", e.currentTarget.value)}
+                      placeholder="0"
+                    />
+                  </div>
+                  {/* Unit */}
+                  <div style={{ display: "flex", flexDirection: "column", justifyContent: "flex-start", maxWidth: 120, margin: 0, marginRight: "auto" }}>
+                    <div style={{ height: 24 }} />
+                    <s-select
+                      label="Unit"
+                      labelAccessibilityVisibility="exclusive"
+                      style={{ width: 120, maxWidth: 120, minWidth: 0, boxSizing: "border-box", flex: "0 0 auto" }}
+                      value={edit.weightUnit ?? "GRAMS"}
+                      onChange={e => setVariant(v.id, "weightUnit", e.currentTarget.value)}
+                    >
+                      <s-option value="GRAMS">g</s-option>
+                      <s-option value="KILOGRAMS">kg</s-option>
+                      <s-option value="OUNCES">oz</s-option>
+                      <s-option value="POUNDS">lb</s-option>
+                    </s-select>
+                  </div>
+                  {/* Qty (Available qty) */}
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                    <div style={{ width: `${Math.min(120, Math.max(70, String(edit.inventoryQty ?? 0).length * 9 + 50))}px` }}>
+                      <s-number-field
+                        label="Inventory"
+                        style={{ width: "100%" }}
+                        min="0"
+                        step="1"
+                        value={String(edit.inventoryQty ?? 0)}
+                        onInput={e => setVariant(v.id, "inventoryQty", e.currentTarget.value)}
+                        disabled={!edit.tracked}
+                      />
+                    </div>
+                    {edit.locationName && <div style={{ fontSize: 10, color: "#6d7175", marginTop: 2, whiteSpace: "nowrap" }}>{edit.locationName}</div>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* ── Secondary fields (checked less often) — no table header, each field carries its own label ── */}
+          <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", marginBottom: 16 }}>
+            {variantList.map((v, idx) => {
+              const edit = variantEdits[v.id] ?? {};
+              return (
+                <div key={v.id} style={{ ...sx.variantRow5col, borderBottom: idx < variantList.length - 1 ? "1px solid #f1f1f1" : "none" }}>
+                  {/* Barcode */}
+                  <div style={{ display: "flex", justifyContent: "center", marginTop: -7 }}>
+                    <div style={{ width: `${Math.min(220, Math.max(48, Math.max((edit.sku ?? "").length, (edit.barcode ?? "").length) * 8 + 26))}px` }}>
+                      <s-text-field
+                        label="Barcode"
+                        value={edit.barcode ?? ""}
+                        onInput={e => setVariant(v.id, "barcode", e.currentTarget.value)}
+                        placeholder="—"
+                      />
+                    </div>
+                  </div>
+                  {/* Charge tax */}
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                    <div style={sx.fieldCaption}>Charge tax</div>
+                    <s-checkbox
+                      accessibilityLabel="Charge tax"
+                      checked={edit.taxable ?? true}
+                      onChange={e => setVariant(v.id, "taxable", e.currentTarget.checked)}
+                    />
+                  </div>
+                  {/* Tracked */}
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                    <div style={sx.fieldCaption}>Tracked</div>
+                    <s-checkbox
+                      accessibilityLabel="Inventory tracked"
+                      checked={edit.tracked ?? false}
+                      onChange={e => setVariant(v.id, "tracked", e.currentTarget.checked)}
+                    />
+                  </div>
+                  {/* Physical product */}
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                    <div style={sx.fieldCaption}>Physical product</div>
+                    <s-checkbox
+                      accessibilityLabel="Physical product"
+                      checked={edit.requiresShipping ?? true}
+                      onChange={e => setVariant(v.id, "requiresShipping", e.currentTarget.checked)}
+                    />
+                  </div>
+                  {/* Sell out-of-stock */}
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                    <div style={sx.fieldCaption}>Sell out-of-stock</div>
+                    <s-checkbox
+                      accessibilityLabel="Sell when out of stock"
+                      checked={edit.inventoryPolicy === "CONTINUE"}
+                      onChange={e => setVariant(v.id, "inventoryPolicy", e.currentTarget.checked ? "CONTINUE" : "DENY")}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Description — rich text editor */}
           <div style={{ marginBottom: 16 }}>
             <Field label="Description" span>
               <RichTextEditor
@@ -1490,112 +2035,27 @@ const ProductRow = forwardRef(function ProductRow({ product, allSkus, collection
             </Field>
           </div>
 
-          {/* ── Images ── */}
-          <div style={{ marginBottom: 20 }}>
-            <ImageManager images={images} onUpdate={setImages} />
-          </div>
-
-          {/* Two-column layout */}
-          <div style={{ ...sx.grid, marginBottom: 12, alignItems: "start" }}>
-            {/* Left column */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <Field label="Type">
-                <input style={sx.input} value={productFields.productType} onChange={e => setField("productType", e.target.value)} placeholder="e.g. Clothing" />
-              </Field>
-              <Field label="Vendor">
-                <input style={sx.input} value={productFields.vendor} onChange={e => setField("vendor", e.target.value)} />
-              </Field>
-              <Field label="Condition">
-                <select style={sx.select} value={productFields.condition} onChange={e => setField("condition", e.target.value)}>
-                  <option value="">— Select condition —</option>
-                  {EBAY_CONDITIONS.map(c => (
-                    <option key={c.code} value={c.code}>{c.label}</option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-            {/* Right column */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <Field label="Category">
-                <CategoryEditor category={category} onChange={setCategory} />
-              </Field>
-              <Field label="Tags">
-                <TagEditor tags={tags} onChange={setTags} />
-              </Field>
-            </div>
-          </div>
-
-          {/* ── Variants / Inventory ── */}
-          <div style={sx.sectionLabel}>Variants</div>
-          <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", marginBottom: 16 }}>
-            <div style={{ ...sx.variantRow, background: "#f6f6f7", borderBottom: "1px solid #e1e3e5" }}>
-              <div style={sx.variantHead}>SKU</div>
-              <div style={sx.variantHead}>Options</div>
-              <div style={sx.variantHead}>Price ($)</div>
-              <div style={sx.variantHead}>Weight</div>
-              <div style={sx.variantHead}>Inventory</div>
-              <div style={{ ...sx.variantHead, textAlign: "center" }}>Tracked</div>
-            </div>
-            {variantList.map((v, idx) => {
-              const edit        = variantEdits[v.id] ?? {};
-              const optionLabel = v.selectedOptions?.map(o => o.value).join(" / ") ?? v.title ?? "Default";
-              // SKU duplicate: typed SKU exists in the collection's loaded SKUs (and isn't the original SKU for this variant)
-              const skuDupe = edit.sku && edit.sku !== (v.sku ?? "") && allSkus.has(edit.sku);
-              return (
-                <div key={v.id} style={{ ...sx.variantRow, borderBottom: idx < variantList.length - 1 ? "1px solid #f1f1f1" : "none" }}>
-                  {/* SKU — editable */}
-                  <div>
-                    <input
-                      style={{ ...sx.input, width: "100%", borderColor: skuDupe ? "#d82c0d" : undefined }}
-                      value={edit.sku ?? ""}
-                      onChange={e => setVariant(v.id, "sku", e.target.value)}
-                      placeholder="—"
-                    />
-                    {skuDupe && (
-                      <div style={{ fontSize: 10, color: "#d82c0d", marginTop: 2, fontWeight: 600 }}>⚠ SKU already in use</div>
-                    )}
-                  </div>
-                  {/* Options */}
-                  <div style={{ fontSize: 12, color: "#6d7175", paddingTop: 9 }}>{optionLabel}</div>
-                  {/* Price */}
-                  <div>
-                    <input style={{ ...sx.input, width: "100%" }} type="number" step="0.01" min="0"
-                      value={edit.price ?? ""} onChange={e => setVariant(v.id, "price", e.target.value)} />
-                  </div>
-                  {/* Weight */}
-                  <div style={{ display: "flex", gap: 4 }}>
-                    <input style={{ ...sx.input, width: 60 }} type="number" step="0.01" min="0"
-                      value={edit.weightValue ?? ""} onChange={e => setVariant(v.id, "weightValue", e.target.value)} placeholder="0" />
-                    <select style={{ ...sx.input, width: 54 }} value={edit.weightUnit ?? "GRAMS"}
-                      onChange={e => setVariant(v.id, "weightUnit", e.target.value)}>
-                      <option value="GRAMS">g</option>
-                      <option value="KILOGRAMS">kg</option>
-                      <option value="OUNCES">oz</option>
-                      <option value="POUNDS">lb</option>
-                    </select>
-                  </div>
-                  {/* Inventory */}
-                  <div>
-                    <input style={{ ...sx.input, width: "100%" }} type="number" min="0" step="1"
-                      value={edit.inventoryQty ?? 0} onChange={e => setVariant(v.id, "inventoryQty", e.target.value)}
-                      disabled={!edit.tracked} />
-                    {edit.locationName && <div style={{ fontSize: 10, color: "#6d7175", marginTop: 2 }}>{edit.locationName}</div>}
-                  </div>
-                  {/* Tracked */}
-                  <div style={{ textAlign: "center", paddingTop: 9 }}>
-                    <input type="checkbox" checked={edit.tracked ?? false}
-                      onChange={e => setVariant(v.id, "tracked", e.target.checked)}
-                      style={{ width: 16, height: 16, cursor: "pointer" }} />
-                  </div>
-                </div>
-              );
-            })}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <button
+              onClick={handleDiscard}
+              disabled={isSaving || !isDirty}
+              style={{ ...sx.discardBtn, opacity: isSaving || !isDirty ? 0.4 : 1, cursor: isSaving || !isDirty ? "default" : "pointer" }}
+            >
+              Discard
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={isSaving || !isDirty}
+              style={{ ...sx.saveBtn, opacity: isSaving || !isDirty ? 0.5 : 1, cursor: isSaving || !isDirty ? "default" : "pointer" }}
+            >
+              {isSaving ? "Saving…" : "Save"}
+            </button>
           </div>
         </div>
       )}
     </div>
   );
-});
+}
 
 // ── CollectionSelector ────────────────────────────────────────────────────────
 function CollectionSelector({ recentCollections, activeCollectionId, onSelect }) {
@@ -1742,7 +2202,7 @@ function AddProductsRow({ collectionId, onAdded }) {
 }
 
 // ── CollectionSidebar — floating left panel ───────────────────────────────────
-function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, open, onToggle, onProductsChanged, selectedProductId, onSelectProduct, productStatuses = new Map() }) {
+function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, open, onToggle, onProductsChanged, onJumpToProduct }) {
   const searchFetcher  = useFetcher();
   const createFetcher  = useFetcher();
   const prodSearchF    = useFetcher();
@@ -1918,23 +2378,21 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
                 <div style={sx.dropItem}>No products in collection.</div>
               )}
               {visibleProds.map(p => {
-                const sku      = p.variants?.edges?.[0]?.node?.sku ?? "";
-                const pending  = pendingIds.has(p.id);
-                const isActive = p.id === selectedProductId;
-                const status   = productStatuses.get(p.id);
+                const sku     = p.variants?.edges?.[0]?.node?.sku ?? "";
+                const pending = pendingIds.has(p.id);
                 return (
-                  <div key={p.id}
-                    style={{ ...sx.sidebarCollRow, display: "flex", alignItems: "center", gap: 8, opacity: pending ? 0.55 : 1, background: isActive ? "#f0f7f4" : undefined, borderLeft: isActive ? "3px solid #008060" : "3px solid transparent", cursor: pending ? "default" : "pointer" }}
-                    onClick={() => !pending && onSelectProduct?.(p)}>
+                  <div
+                    key={p.id}
+                    style={{ ...sx.sidebarCollRow, display: "flex", alignItems: "center", gap: 8, opacity: pending ? 0.55 : 1, cursor: "pointer" }}
+                    onClick={() => onJumpToProduct?.(p.id)}
+                  >
                     {p.featuredImage?.url
                       ? <img src={p.featuredImage.url} alt="" style={{ width: 32, height: 32, objectFit: "cover", borderRadius: 4, flexShrink: 0 }} />
                       : <div style={{ width: 32, height: 32, background: "#f1f1f1", borderRadius: 4, flexShrink: 0 }} />}
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 12, fontWeight: isActive ? 700 : 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      <div style={{ fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                         textDecoration: pending ? "line-through" : undefined }}>{p.title}</div>
                       {sku && <div style={{ fontSize: 10, color: "#6d7175" }}>SKU: {sku}</div>}
-                      {status === "saved"   && <span style={sx.badgeSaved}>✓ Saved</span>}
-                      {status === "unsaved" && <span style={sx.badgeDirty}>Unsaved</span>}
                     </div>
                     {pending ? (
                       <button
@@ -1960,47 +2418,35 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
 }
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
-export default function Prep() {
-  const { recentCollections, collection, products } = useLoaderData();
+export default function PrepB() {
+  const { recentCollections, collection, products, vendorSuggestions, typeSuggestions, tagSuggestions, shop } = useLoaderData();
   const [, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [highlightedProductId, setHighlightedProductId] = useState(null);
+  const highlightTimerRef = useRef(null);
 
   // Auto-open sidebar when no collection is selected
   useEffect(() => {
     if (!collection) setSidebarOpen(true);
   }, [collection]);
 
-  const [selectedProductId, setSelectedProductId] = useState(null);
-  const productRowRef = useRef(null);
-  const [productRowState, setProductRowState] = useState({ isDirty: false, isSaving: false, saved: false });
-  const [savedProductIds, setSavedProductIds] = useState(new Set());
-  const [draftProductIds, setDraftProductIds] = useState(new Set());
+  function jumpToProduct(productId) {
+    document.getElementById(`product-row-${productId}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    clearTimeout(highlightTimerRef.current);
+    setHighlightedProductId(productId);
+    highlightTimerRef.current = setTimeout(() => setHighlightedProductId(null), 1500);
+  }
 
-  // Reset selection + status sets when collection changes; scan sessionStorage for existing drafts
+  const [listSearch, setListSearch]   = useState("");
+  const [listSort,   setListSort]     = useState("default");
+  const [listVendor, setListVendor]   = useState("");
+
+  // Reset filters when collection changes
   useEffect(() => {
-    setSelectedProductId(null);
-    setSavedProductIds(new Set());
-    setDraftProductIds(new Set(
-      products.filter(p => sessionStorage.getItem(`skuboo_draft_${p.id}`) !== null).map(p => p.id)
-    ));
+    setListSearch("");
+    setListSort("default");
+    setListVendor("");
   }, [collection?.id]);
-
-  // Monitor ProductRow state changes
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setProductRowState({
-        isDirty: productRowRef.current?.isDirty ?? false,
-        isSaving: productRowRef.current?.isSaving ?? false,
-        saved: productRowRef.current?.saved ?? false,
-      });
-    }, 100);
-    return () => clearInterval(interval);
-  }, [selectedProductId]);
-
-  const selectedProduct = useMemo(
-    () => products.find(p => p.id === selectedProductId) ?? products[0] ?? null,
-    [products, selectedProductId]
-  );
 
   const allSkus = useMemo(() => {
     const set = new Set();
@@ -2013,45 +2459,61 @@ export default function Prep() {
     return set;
   }, [products]);
 
-  // Called by ProductRow when it saves a draft to sessionStorage or clears it
-  function handleDraftChanged(productId, hasDraft) {
-    setDraftProductIds(prev => {
-      const next = new Set(prev);
-      hasDraft ? next.add(productId) : next.delete(productId);
-      return next;
+  // Store-wide suggestion lists — shared across every ProductRow, like allSkus above.
+  const vendorSuggest = usePaginatedSuggestions("vendor", vendorSuggestions);
+  const typeSuggest   = usePaginatedSuggestions("type",   typeSuggestions);
+  const tagSuggest    = usePaginatedSuggestions("tag",    tagSuggestions);
+
+  const vendors = useMemo(() => {
+    const set = new Set(products.map(p => p.vendor).filter(v => v && v !== "0"));
+    return [...set].sort();
+  }, [products]);
+
+  const filteredProducts = useMemo(() => {
+    let list = [...products];
+    if (listSearch.trim()) {
+      const q = listSearch.toLowerCase();
+      list = list.filter(p =>
+        p.title?.toLowerCase().includes(q) ||
+        p.variants?.edges?.some(e => e.node.sku?.toLowerCase().includes(q))
+      );
+    }
+    if (listVendor) list = list.filter(p => p.vendor === listVendor);
+    if (listSort === "title-asc")   list.sort((a, b) => (a.title ?? "").localeCompare(b.title ?? ""));
+    if (listSort === "title-desc")  list.sort((a, b) => (b.title ?? "").localeCompare(a.title ?? ""));
+    if (listSort === "sku-asc")     list.sort((a, b) => (a.variants?.edges?.[0]?.node?.sku ?? "").localeCompare(b.variants?.edges?.[0]?.node?.sku ?? ""));
+    if (listSort === "sku-desc")    list.sort((a, b) => (b.variants?.edges?.[0]?.node?.sku ?? "").localeCompare(a.variants?.edges?.[0]?.node?.sku ?? ""));
+    if (listSort === "price-asc")   list.sort((a, b) => parseFloat(a.variants?.edges?.[0]?.node?.price ?? 0) - parseFloat(b.variants?.edges?.[0]?.node?.price ?? 0));
+    if (listSort === "price-desc")  list.sort((a, b) => parseFloat(b.variants?.edges?.[0]?.node?.price ?? 0) - parseFloat(a.variants?.edges?.[0]?.node?.price ?? 0));
+    return list;
+  }, [products, listSearch, listSort, listVendor]);
+
+  const isFiltered = listSearch.trim() || listVendor || listSort !== "default";
+
+  const bulkEditUrl = (() => {
+    if (!collection || !shop) return null;
+    const storeHandle = shop.replace(".myshopify.com", "");
+    const numericCollectionId = collection.id.split("/").pop();
+    const productIds = products.map(p => p.id.split("/").pop()).join(",");
+    const returnTo = `/store/${storeHandle}/products?query=collection_id:${numericCollectionId}`;
+    const params = new URLSearchParams({
+      resource_name: "Product",
+      edit: "description,media,tags,status,product_taxonomy_node_id,product_type,vendor,sales_channels,variants.price,variants.cost,variants.taxable,variants.sku,variants.barcode,variants.inventory_policy,variants.inventory_management,variants.defaultPackage,variants.weight,variants.requires_shipping",
+      return_to: returnTo,
+      query: `collection_id:${numericCollectionId}`,
+      order: "created_at desc",
+      ids: productIds,
     });
-  }
-
-  // When the active product finishes saving, promote it to "saved" and clear any draft flag
-  useEffect(() => {
-    if (!selectedProduct?.id) return;
-    if (productRowState.saved && !productRowState.isDirty) {
-      setSavedProductIds(prev => new Set([...prev, selectedProduct.id]));
-      setDraftProductIds(prev => { const n = new Set(prev); n.delete(selectedProduct.id); return n; });
-    }
-  }, [productRowState.saved, productRowState.isDirty, selectedProduct?.id]);
-
-  // Map of productId → "saved" | "unsaved" for sidebar badges
-  const productStatuses = useMemo(() => {
-    const map = new Map();
-    for (const id of savedProductIds) map.set(id, "saved");
-    for (const id of draftProductIds) map.set(id, "unsaved");
-    if (selectedProduct?.id) {
-      if (productRowState.isDirty) map.set(selectedProduct.id, "unsaved");
-      else if (productRowState.saved) map.set(selectedProduct.id, "saved");
-      else if (!draftProductIds.has(selectedProduct.id)) map.delete(selectedProduct.id);
-    }
-    return map;
-  }, [savedProductIds, draftProductIds, selectedProduct?.id, productRowState.isDirty, productRowState.saved]);
+    return `https://admin.shopify.com/store/${storeHandle}/bulk/product?${params.toString()}`;
+  })();
 
   function handleSelectCollection(c) {
     setSearchParams({ collectionId: c.id });
     setSidebarOpen(false);
-    setSelectedProductId(null);
   }
 
   return (
-    <s-page heading="Prep">
+    <s-page heading="Prep B">
       <CollectionSidebar
         activeCollection={collection}
         products={products}
@@ -2060,74 +2522,109 @@ export default function Prep() {
         open={sidebarOpen}
         onToggle={() => setSidebarOpen(v => !v)}
         onProductsChanged={() => setSearchParams({ collectionId: collection?.id })}
-        selectedProductId={selectedProduct?.id}
-        onSelectProduct={p => setSelectedProductId(p.id)}
-        productStatuses={productStatuses}
+        onJumpToProduct={jumpToProduct}
       />
-      {collection && selectedProduct && (
-        <div style={{
-          position: "fixed",
-          top: 0,
-          left: sidebarOpen ? SIDEBAR_WIDTH : 0,
-          right: 0,
-          height: 60,
-          background: "#fff",
-          borderBottom: "1px solid #e1e3e5",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          paddingLeft: 16,
-          paddingRight: 16,
-          zIndex: 100,
-          transition: "left 0.25s cubic-bezier(0.4,0,0.2,1)",
-        }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: "#202223", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {selectedProduct.title}
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-            {productRowState.isDirty && !productRowState.isSaving && <span style={sx.badgeDirty}>Unsaved</span>}
-            {productRowState.isSaving && <span style={sx.badgeSaving}>Saving…</span>}
-            <button
-              onClick={() => productRowRef.current?.discard?.()}
-              disabled={productRowState.isSaving || !productRowState.isDirty}
-              style={{ ...sx.discardBtn, opacity: productRowState.isSaving || !productRowState.isDirty ? 0.4 : 1, cursor: productRowState.isSaving || !productRowState.isDirty ? "default" : "pointer", padding: "8px 16px", fontSize: 13 }}
-            >
-              Discard
-            </button>
-            <button
-              onClick={() => productRowRef.current?.save?.()}
-              disabled={productRowState.isSaving || !productRowState.isDirty}
-              style={{ ...sx.saveBtn, opacity: productRowState.isSaving || !productRowState.isDirty ? 0.5 : 1, cursor: productRowState.isSaving || !productRowState.isDirty ? "default" : "pointer", padding: "8px 16px", fontSize: 13 }}
-            >
-              {productRowState.isSaving ? "Saving…" : "Save"}
-            </button>
-          </div>
-        </div>
-      )}
-      <div style={{
-        marginLeft: sidebarOpen ? SIDEBAR_WIDTH : 0,
-        transition: "margin-left 0.25s cubic-bezier(0.4,0,0.2,1)",
-        paddingTop: collection && selectedProduct ? 60 : 0,
-      }}>
+      <div style={{ position: "relative" }}>
+        {collection && (
+          <a
+            href={bulkEditUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              position: "absolute", top: 0, right: 0, zIndex: 1,
+              display: "inline-block", fontSize: 11, fontWeight: 600, color: "#202223",
+              background: "#fff", border: "1px solid #c9cccf", borderRadius: 5,
+              padding: "2px 8px", textDecoration: "none", lineHeight: 1.4,
+            }}
+          >
+            Bulk Edit ↗
+          </a>
+        )}
         {collection ? (
-          selectedProduct ? (
-            <s-section heading={selectedProduct.title}>
-              <ProductRow
-                ref={productRowRef}
-                key={selectedProduct.id}
-                product={selectedProduct}
-                allSkus={allSkus}
+          <s-section heading={collection.title}>
+            <div style={{ border: "1px solid #e1e3e5", borderRadius: 8, overflow: "hidden", background: "#fff" }}>
+              {/* ── Search / Filter / Sort toolbar ── */}
+              {products.length > 0 && (
+                <div style={sx.listToolbar}>
+                  <input
+                    style={{ ...sx.input, flex: "1 1 180px", minWidth: 0 }}
+                    value={listSearch}
+                    onChange={e => setListSearch(e.target.value)}
+                    placeholder="Search by title or SKU…"
+                  />
+                  {vendors.length > 1 && (
+                    <select
+                      style={{ ...sx.select, width: "auto", flex: "0 0 auto", minWidth: 110 }}
+                      value={listVendor}
+                      onChange={e => setListVendor(e.target.value)}
+                    >
+                      <option value="">All vendors</option>
+                      {vendors.map(v => <option key={v} value={v}>{v}</option>)}
+                    </select>
+                  )}
+                  <select
+                    style={{ ...sx.select, width: "auto", flex: "0 0 auto", minWidth: 140 }}
+                    value={listSort}
+                    onChange={e => setListSort(e.target.value)}
+                  >
+                    <option value="default">Sort: Default</option>
+                    <option value="title-asc">Title A → Z</option>
+                    <option value="title-desc">Title Z → A</option>
+                    <option value="sku-asc">SKU ↑</option>
+                    <option value="sku-desc">SKU ↓</option>
+                    <option value="price-asc">Price ↑</option>
+                    <option value="price-desc">Price ↓</option>
+                  </select>
+                  {isFiltered && (
+                    <button
+                      style={{ ...sx.discardBtn, padding: "6px 12px", fontSize: 12, flexShrink: 0 }}
+                      onClick={() => { setListSearch(""); setListVendor(""); setListSort("default"); }}
+                    >
+                      Clear
+                    </button>
+                  )}
+                  <span style={{ fontSize: 12, color: "#6d7175", flexShrink: 0, whiteSpace: "nowrap" }}>
+                    {filteredProducts.length}{isFiltered ? ` of ${products.length}` : ""} item{products.length !== 1 ? "s" : ""}
+                  </span>
+                </div>
+              )}
+
+              {products.length === 0 ? (
+                <div style={{ padding: "16px", fontSize: 13, color: "#6d7175" }}>No products in this collection yet.</div>
+              ) : filteredProducts.length === 0 ? (
+                <div style={{ padding: "16px", fontSize: 13, color: "#6d7175" }}>No products match your search.</div>
+              ) : (
+                filteredProducts.map(p => (
+                  <ProductRow
+                    key={p.id}
+                    product={p}
+                    shop={shop}
+                    allSkus={allSkus}
+                    vendorSuggestions={vendorSuggest.nodes}
+                    vendorSuggestionsHasMore={vendorSuggest.hasNextPage}
+                    vendorSuggestionsLoading={vendorSuggest.loading}
+                    onLoadMoreVendors={vendorSuggest.loadMore}
+                    typeSuggestions={typeSuggest.nodes}
+                    typeSuggestionsHasMore={typeSuggest.hasNextPage}
+                    typeSuggestionsLoading={typeSuggest.loading}
+                    onLoadMoreTypes={typeSuggest.loadMore}
+                    tagSuggestions={tagSuggest.nodes}
+                    tagSuggestionsHasMore={tagSuggest.hasNextPage}
+                    tagSuggestionsLoading={tagSuggest.loading}
+                    onLoadMoreTags={tagSuggest.loadMore}
+                    collectionId={collection.id}
+                    onRemoved={() => setSearchParams({ collectionId: collection.id })}
+                    highlighted={highlightedProductId === p.id}
+                  />
+                ))
+              )}
+
+              <AddProductsRow
                 collectionId={collection.id}
-                onRemoved={() => { setSearchParams({ collectionId: collection.id }); setSelectedProductId(null); }}
-                onDraftChanged={handleDraftChanged}
-                alwaysOpen
+                onAdded={() => setSearchParams({ collectionId: collection.id })}
               />
-            </s-section>
-          ) : (
-            <s-section>
-              <s-paragraph>No products in this collection yet. Use the sidebar to add one.</s-paragraph>
-            </s-section>
-          )
+            </div>
+          </s-section>
         ) : (
           <s-section>
             <s-paragraph>Open the Collections panel to select or create a collection to prep.</s-paragraph>
@@ -2156,10 +2653,12 @@ const sx = {
   dropdown: {
     position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0,
     border: "1px solid #e1e3e5", borderRadius: 6, background: "#fff",
-    boxShadow: "0 4px 12px rgba(0,0,0,0.1)", zIndex: 10, overflow: "hidden",
+    boxShadow: "0 4px 12px rgba(0,0,0,0.1)", zIndex: 10,
+    maxHeight: 280, overflowY: "auto", overflowX: "hidden",
   },
   dropItem:    { padding: "10px 14px", fontSize: 14, color: "#6d7175" },
   dropItemBtn: { padding: "10px 14px", fontSize: 14, cursor: "pointer", borderBottom: "1px solid #f1f1f1" },
+  dropLoadMore: { textAlign: "center", fontWeight: 600, color: "#005bd3", background: "#f9fafb" },
   categoryPanel: {
     position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0,
     border: "1px solid #e1e3e5", borderRadius: 6, background: "#fff",
@@ -2220,11 +2719,32 @@ const sx = {
     cursor: "text",
   },
   grid:       { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 },
+  relatedFieldsBox: {
+    display: "flex", flexDirection: "column", gap: 12,
+    padding: 12, background: "#eaebed", borderRadius: 8,
+  },
   variantRow: {
-    display: "grid", gridTemplateColumns: "130px 1fr 90px 130px 80px 50px",
+    display: "grid", gridTemplateColumns: "1fr",
     alignItems: "start", padding: "10px 12px", gap: 10,
   },
-  variantHead: { fontSize: 11, fontWeight: 700, color: "#6d7175", textTransform: "uppercase", letterSpacing: "0.4px" },
+  variantRowShipping: {
+    display: "grid", gridTemplateColumns: "1fr 1fr 1fr",
+    alignItems: "start", padding: "10px 12px", gap: 10,
+  },
+  variantRowInventory: {
+    display: "grid", gridTemplateColumns: "1.3fr 1.3fr 1.3fr 70px 1fr",
+    alignItems: "start", padding: "10px 12px", gap: 10,
+  },
+  variantRowPrice: {
+    display: "grid", gridTemplateColumns: "1fr 1fr 1fr",
+    alignItems: "start", padding: "10px 12px", gap: 10,
+  },
+  variantRow5col: {
+    display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr",
+    alignItems: "start", padding: "10px 12px", gap: 10,
+  },
+  fieldCaption: { fontSize: 11, fontWeight: 600, color: "#202223", textAlign: "center", marginBottom: 4 },
+  variantHead: { fontSize: 11, fontWeight: 700, color: "#202223", textTransform: "uppercase", letterSpacing: "0.4px" },
   errorBox: {
     background: "#fff4f4", border: "1px solid #ffd2d2", borderRadius: 6,
     padding: "10px 14px", fontSize: 13, color: "#d82c0d", marginBottom: 12,
@@ -2236,6 +2756,9 @@ const sx = {
   badgeDirty:  { background: "#fff3cd", color: "#856404", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, border: "1px solid #ffc107" },
   badgeSaved:  { background: "#d4edda", color: "#155724", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, border: "1px solid #c3e6cb" },
   badgeSaving: { background: "#e8f0fe", color: "#005bd3", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, border: "1px solid #c2d4f8" },
+  statusBadgeActive:   { background: "#d4edda", color: "#155724", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, border: "1px solid #c3e6cb", flexShrink: 0 },
+  statusBadgeDraft:    { background: "#e8f0fe", color: "#005bd3", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, border: "1px solid #c2d4f8", flexShrink: 0 },
+  statusBadgeUnlisted: { background: "#e4e5e7", color: "#494b4f", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, border: "1px solid #c9cccf", flexShrink: 0 },
   saveBtn: {
     background: "#008060", color: "#fff", border: "none",
     borderRadius: 6, padding: "10px 20px", fontSize: 14, fontWeight: 600,
@@ -2254,13 +2777,14 @@ const sx = {
     border: "none", outline: "none", fontSize: 13, color: "#202223",
     background: "transparent", minWidth: 80, flex: 1,
   },
+  bubbleFieldStyle: { minWidth: 120, flex: 1 },
   bubbleX: {
     background: "none", border: "none", cursor: "pointer", padding: "0 0 0 4px",
     fontSize: 15, lineHeight: 1, color: "inherit", opacity: 0.55, fontWeight: 700,
   },
   tagBubble: {
     display: "inline-flex", alignItems: "center",
-    background: "#e3f1df", color: "#2a5e34", border: "1px solid #b8dbb2",
+    background: "#e4e5e7", color: "#494b4f", border: "1px solid #c9cccf",
     borderRadius: 999, padding: "3px 8px 3px 10px", fontSize: 12, fontWeight: 500,
   },
   collectionBubble: {
