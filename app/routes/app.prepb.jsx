@@ -18,6 +18,7 @@ function useDebounce(fn, delay = 500) {
   };
 }
 const PRODUCTS_COUNT       = 50;
+const VARIANTS_COUNT       = 50;
 const SEARCH_COUNT         = 10;
 const SUGGEST_PAGE_SIZE    = 250;
 const SUGGEST_AUTOLOAD_CAP = 2000;
@@ -166,7 +167,7 @@ export const loader = async ({ request }) => {
 
   const prodRes = await admin.graphql(
     `#graphql
-    query getCollectionProducts($id: ID!, $first: Int!) {
+    query getCollectionProducts($id: ID!, $first: Int!, $variantsFirst: Int!) {
       collection(id: $id) {
         id title
         products(first: $first) {
@@ -185,7 +186,7 @@ export const loader = async ({ request }) => {
               }
               collections(first: 10) { edges { node { id title } } }
               metafield(namespace: "custom", key: "ebay_condition_id") { id value }
-              variants(first: 10) {
+              variants(first: $variantsFirst) {
                 edges {
                   node {
                     id title price sku barcode inventoryPolicy taxable
@@ -212,7 +213,7 @@ export const loader = async ({ request }) => {
         }
       }
     }`,
-    { variables: { id: collectionId, first: PRODUCTS_COUNT } }
+    { variables: { id: collectionId, first: PRODUCTS_COUNT, variantsFirst: VARIANTS_COUNT } }
   );
   const prodData   = await prodRes.json();
   const collection = prodData.data.collection;
@@ -684,6 +685,44 @@ export const action = async ({ request }) => {
       return { createdCollection: data.data.collectionCreate.collection };
     } catch (err) {
       return { createError: String(err) };
+    }
+  }
+
+  // ── Find or create today's "Singles" collection ───────────────────────────
+  if (intent === "find-or-create-singles") {
+    const title = (form.get("title") ?? "").trim();
+    if (!title) return { singlesError: "Missing title." };
+    try {
+      const searchRes = await admin.graphql(
+        `#graphql
+        query searchSinglesCollections($first: Int!, $query: String!) {
+          collections(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) {
+            edges { node { id title productsCount { count } } }
+          }
+        }`,
+        { variables: { first: 50, query: "Singles" } }
+      );
+      const searchData = await searchRes.json();
+      const matches  = searchData.data?.collections?.edges?.map(e => e.node) ?? [];
+      const existing = matches.find(c => c.title === title);
+      if (existing) return { singlesCollection: existing };
+
+      const createRes = await admin.graphql(
+        `#graphql
+        mutation createSinglesCollection($input: CollectionInput!) {
+          collectionCreate(input: $input) {
+            collection { id title productsCount { count } }
+            userErrors { field message }
+          }
+        }`,
+        { variables: { input: { title } } }
+      );
+      const createData = await createRes.json();
+      const errs = createData.data?.collectionCreate?.userErrors ?? [];
+      if (errs.length > 0) return { singlesError: errs[0].message };
+      return { singlesCollection: createData.data.collectionCreate.collection };
+    } catch (err) {
+      return { singlesError: String(err) };
     }
   }
 
@@ -1464,6 +1503,70 @@ function initVariantEdits(product) {
   return edits;
 }
 
+function formatVariantOptions(v, skipFirst) {
+  const opts  = (v.selectedOptions ?? []).filter(o => !(o.name === "Title" && o.value === "Default Title"));
+  const shown = skipFirst ? opts.slice(1) : opts;
+  if (shown.length === 0) return null;
+  return shown.map(o => o.value).join("   ·   ");
+}
+
+// Category-row price summary — a single value if every variant in the group shares
+// it, otherwise the min–max range, reading live (unsaved) edits so it stays in sync.
+function summarizeGroupPrice(group, variantEdits) {
+  const prices = group.variants
+    .map(v => parseFloat(variantEdits[v.id]?.price ?? ""))
+    .filter(n => !isNaN(n));
+  if (prices.length === 0) return "—";
+  const min = Math.min(...prices), max = Math.max(...prices);
+  return min === max ? `$${min.toFixed(2)}` : `$${min.toFixed(2)}–$${max.toFixed(2)}`;
+}
+
+// Category-row inventory summary — total across the group's variants, live edits included.
+function summarizeGroupInventory(group, variantEdits) {
+  return group.variants.reduce((sum, v) => sum + (parseInt(variantEdits[v.id]?.inventoryQty, 10) || 0), 0);
+}
+
+// Groups variants into sections by their first variant option (e.g. Size),
+// preserving each value's first-appearance order in variantList — which
+// already reflects the merchant's intended position order from Shopify.
+function groupVariantsByFirstOption(variantList) {
+  const groups        = [];
+  const indexForLabel = new Map();
+  for (const v of variantList) {
+    const first = (v.selectedOptions ?? [])[0];
+    const name  = first?.name  ?? "";
+    const value = first?.value ?? "Other";
+    const label = first ? `${name}: ${value}` : "Other";
+    if (!indexForLabel.has(label)) {
+      indexForLabel.set(label, groups.length);
+      groups.push({ label, value, variants: [] });
+    }
+    groups[indexForLabel.get(label)].variants.push(v);
+  }
+  return groups;
+}
+
+// Common size words, biggest to smallest — matches merchant sizing regardless
+// of the arbitrary order variants happened to be created in.
+const SIZE_TIERS = [
+  ["6xl"], ["5xl"], ["4xl"], ["3xl", "xxxl"], ["2xl", "xxl"],
+  ["xl", "x-large", "xlarge"], ["large", "l"], ["medium", "m"],
+  ["small", "s"], ["xs", "x-small", "xsmall"], ["xxs", "2xs"], ["xxxs", "3xs"],
+];
+const SIZE_RANK = new Map();
+SIZE_TIERS.forEach((aliases, tier) => aliases.forEach(a => SIZE_RANK.set(a, tier)));
+
+// If every group's value is a recognized size word, reorder large-to-small.
+// Otherwise leave the groups in their natural (merchant-defined) order.
+function sortGroupsBySizeIfApplicable(groups) {
+  const ranks = groups.map(g => SIZE_RANK.get(String(g.value).trim().toLowerCase()));
+  if (ranks.some(r => r === undefined)) return groups;
+  return groups
+    .map((g, i) => ({ g, rank: ranks[i] }))
+    .sort((a, b) => a.rank - b.rank)
+    .map(({ g }) => g);
+}
+
 // ── ProductRow ────────────────────────────────────────────────────────────────
 function ProductRow({
   product, shop, allSkus,
@@ -1553,6 +1656,25 @@ function ProductRow({
   // Variants
   const [variantEdits, setVariantEdits]         = useState(() => initVariantEdits(product));
   const [baseVariantEdits, setBaseVariantEdits] = useState(() => initVariantEdits(product));
+  const [variantsSectionOpen, setVariantsSectionOpen] = useState(true);
+  // Table starts open, but every category card starts collapsed — expand this to include every group's label up front.
+  const [collapsedGroups, setCollapsedGroups]         = useState(() => {
+    const initialVariants = product.variants?.edges?.map(e => e.node) ?? [];
+    const initialGroups   = sortGroupsBySizeIfApplicable(groupVariantsByFirstOption(initialVariants));
+    return new Set(initialGroups.map(g => g.label));
+  });
+
+  function getOrderedVariantGroups(list) {
+    return sortGroupsBySizeIfApplicable(groupVariantsByFirstOption(list));
+  }
+
+  function toggleGroupCollapsed(label) {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label); else next.add(label);
+      return next;
+    });
+  }
 
   // After successful save — update all base states
   useEffect(() => {
@@ -1661,6 +1783,8 @@ function ProductRow({
   }
 
   const variantList = product.variants?.edges?.map(e => e.node) ?? [];
+  const variantsMaxLoaded = variantList.length >= VARIANTS_COUNT;
+  const productAdminUrl   = `https://${shop}/admin/products/${product.id.split("/").pop()}`;
 
   // Subtext for header
   const headerSubtext = (() => {
@@ -1887,143 +2011,299 @@ function ProductRow({
             </div>
           </div>
 
-          {/* ── Primary fields (most-used — checked every time) — no table header, each field carries its own label ── */}
-          <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", marginBottom: 16 }}>
-            {variantList.map((v, idx) => {
-              const edit = variantEdits[v.id] ?? {};
-              // SKU duplicate: typed SKU exists in the collection's loaded SKUs (and isn't the original SKU for this variant)
-              const skuDupe = edit.sku && edit.sku !== (v.sku ?? "") && allSkus.has(edit.sku);
-              return (
-                <div key={v.id} style={{ ...sx.variantRow5col, borderBottom: idx < variantList.length - 1 ? "1px solid #f1f1f1" : "none" }}>
-                  {/* SKU */}
-                  <div style={{ display: "flex", justifyContent: "center" }}>
-                    <div style={{ width: `${Math.min(220, Math.max(48, Math.max((edit.sku ?? "").length, (edit.barcode ?? "").length) * 8 + 26))}px` }}>
-                      <s-text-field
-                        label="SKU"
-                        error={skuDupe ? "SKU already in use" : undefined}
-                        value={edit.sku ?? ""}
-                        onInput={e => setVariant(v.id, "sku", e.currentTarget.value)}
-                        placeholder="—"
-                      />
+          {/* ── Single variant — default layout, always visible, no options row ── */}
+          {variantList.length <= 1 && (
+            <>
+              <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", marginBottom: 16 }}>
+                {variantList.map((v, idx) => {
+                  const edit = variantEdits[v.id] ?? {};
+                  return (
+                    <div key={v.id} style={{ ...sx.variantRow5col, borderBottom: idx < variantList.length - 1 ? "1px solid #f1f1f1" : "none" }}>
+                      {/* Barcode */}
+                      <div style={{ display: "flex", justifyContent: "center" }}>
+                        <div style={{ width: `${Math.min(220, Math.max(48, Math.max((edit.sku ?? "").length, (edit.barcode ?? "").length) * 8 + 26))}px` }}>
+                          <s-text-field
+                            label="Barcode"
+                            value={edit.barcode ?? ""}
+                            onInput={e => setVariant(v.id, "barcode", e.currentTarget.value)}
+                            placeholder="—"
+                          />
+                        </div>
+                      </div>
+                      {/* Price */}
+                      <div style={{ display: "flex", justifyContent: "center", maxWidth: 110, margin: "0 auto" }}>
+                        <s-number-field
+                          label="Price"
+                          style={{ width: 110, maxWidth: 110, minWidth: 0, boxSizing: "border-box", flex: "0 0 auto" }}
+                          prefix="$"
+                          step="0.01"
+                          min="0"
+                          value={edit.price ?? ""}
+                          onInput={e => setVariant(v.id, "price", e.currentTarget.value)}
+                        />
+                      </div>
+                      {/* Weight */}
+                      <div style={{ display: "flex", justifyContent: "flex-end", maxWidth: 90, margin: 0, marginLeft: "auto" }}>
+                        <s-number-field
+                          label="Weight"
+                          style={{ width: 90, maxWidth: 90, minWidth: 0, boxSizing: "border-box", flex: "0 0 auto" }}
+                          step="0.01"
+                          min="0"
+                          value={edit.weightValue ?? ""}
+                          onInput={e => setVariant(v.id, "weightValue", e.currentTarget.value)}
+                          placeholder="0"
+                        />
+                      </div>
+                      {/* Unit */}
+                      <div style={{ display: "flex", flexDirection: "column", justifyContent: "flex-start", maxWidth: 120, margin: 0, marginRight: "auto" }}>
+                        <div style={{ height: 24 }} />
+                        <s-select
+                          label="Unit"
+                          labelAccessibilityVisibility="exclusive"
+                          style={{ width: 120, maxWidth: 120, minWidth: 0, boxSizing: "border-box", flex: "0 0 auto" }}
+                          value={edit.weightUnit ?? "GRAMS"}
+                          onChange={e => setVariant(v.id, "weightUnit", e.currentTarget.value)}
+                        >
+                          <s-option value="GRAMS">g</s-option>
+                          <s-option value="KILOGRAMS">kg</s-option>
+                          <s-option value="OUNCES">oz</s-option>
+                          <s-option value="POUNDS">lb</s-option>
+                        </s-select>
+                      </div>
+                      {/* Qty (Available qty) */}
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                        <div style={{ width: `${Math.min(120, Math.max(70, String(edit.inventoryQty ?? 0).length * 9 + 50))}px` }}>
+                          <s-number-field
+                            label="Inventory"
+                            style={{ width: "100%" }}
+                            min="0"
+                            step="1"
+                            value={String(edit.inventoryQty ?? 0)}
+                            onInput={e => setVariant(v.id, "inventoryQty", e.currentTarget.value)}
+                            disabled={!edit.tracked}
+                          />
+                        </div>
+                        {edit.locationName && <div style={{ fontSize: 10, color: "#6d7175", marginTop: 2, whiteSpace: "nowrap" }}>{edit.locationName}</div>}
+                      </div>
                     </div>
-                  </div>
-                  {/* Price */}
-                  <div style={{ display: "flex", justifyContent: "center", maxWidth: 110, margin: "0 auto" }}>
-                    <s-number-field
-                      label="Price"
-                      style={{ width: 110, maxWidth: 110, minWidth: 0, boxSizing: "border-box", flex: "0 0 auto" }}
-                      prefix="$"
-                      step="0.01"
-                      min="0"
-                      value={edit.price ?? ""}
-                      onInput={e => setVariant(v.id, "price", e.currentTarget.value)}
-                    />
-                  </div>
-                  {/* Weight */}
-                  <div style={{ display: "flex", justifyContent: "flex-end", maxWidth: 90, margin: 0, marginLeft: "auto" }}>
-                    <s-number-field
-                      label="Weight"
-                      style={{ width: 90, maxWidth: 90, minWidth: 0, boxSizing: "border-box", flex: "0 0 auto" }}
-                      step="0.01"
-                      min="0"
-                      value={edit.weightValue ?? ""}
-                      onInput={e => setVariant(v.id, "weightValue", e.currentTarget.value)}
-                      placeholder="0"
-                    />
-                  </div>
-                  {/* Unit */}
-                  <div style={{ display: "flex", flexDirection: "column", justifyContent: "flex-start", maxWidth: 120, margin: 0, marginRight: "auto" }}>
-                    <div style={{ height: 24 }} />
-                    <s-select
-                      label="Unit"
-                      labelAccessibilityVisibility="exclusive"
-                      style={{ width: 120, maxWidth: 120, minWidth: 0, boxSizing: "border-box", flex: "0 0 auto" }}
-                      value={edit.weightUnit ?? "GRAMS"}
-                      onChange={e => setVariant(v.id, "weightUnit", e.currentTarget.value)}
-                    >
-                      <s-option value="GRAMS">g</s-option>
-                      <s-option value="KILOGRAMS">kg</s-option>
-                      <s-option value="OUNCES">oz</s-option>
-                      <s-option value="POUNDS">lb</s-option>
-                    </s-select>
-                  </div>
-                  {/* Qty (Available qty) */}
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-                    <div style={{ width: `${Math.min(120, Math.max(70, String(edit.inventoryQty ?? 0).length * 9 + 50))}px` }}>
-                      <s-number-field
-                        label="Inventory"
-                        style={{ width: "100%" }}
-                        min="0"
-                        step="1"
-                        value={String(edit.inventoryQty ?? 0)}
-                        onInput={e => setVariant(v.id, "inventoryQty", e.currentTarget.value)}
-                        disabled={!edit.tracked}
-                      />
-                    </div>
-                    {edit.locationName && <div style={{ fontSize: 10, color: "#6d7175", marginTop: 2, whiteSpace: "nowrap" }}>{edit.locationName}</div>}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                  );
+                })}
+              </div>
 
-          {/* ── Secondary fields (checked less often) — no table header, each field carries its own label ── */}
-          <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", marginBottom: 16 }}>
-            {variantList.map((v, idx) => {
-              const edit = variantEdits[v.id] ?? {};
-              return (
-                <div key={v.id} style={{ ...sx.variantRow5col, borderBottom: idx < variantList.length - 1 ? "1px solid #f1f1f1" : "none" }}>
-                  {/* Barcode */}
-                  <div style={{ display: "flex", justifyContent: "center", marginTop: -7 }}>
-                    <div style={{ width: `${Math.min(220, Math.max(48, Math.max((edit.sku ?? "").length, (edit.barcode ?? "").length) * 8 + 26))}px` }}>
-                      <s-text-field
-                        label="Barcode"
-                        value={edit.barcode ?? ""}
-                        onInput={e => setVariant(v.id, "barcode", e.currentTarget.value)}
-                        placeholder="—"
-                      />
+              <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", marginBottom: 16 }}>
+                {variantList.map((v, idx) => {
+                  const edit = variantEdits[v.id] ?? {};
+                  // SKU duplicate: typed SKU exists in the collection's loaded SKUs (and isn't the original SKU for this variant)
+                  const skuDupe = edit.sku && edit.sku !== (v.sku ?? "") && allSkus.has(edit.sku);
+                  return (
+                    <div key={v.id} style={{ ...sx.variantRow5col, borderBottom: idx < variantList.length - 1 ? "1px solid #f1f1f1" : "none" }}>
+                      {/* SKU */}
+                      <div style={{ display: "flex", justifyContent: "center", marginTop: -7 }}>
+                        <div style={{ width: `${Math.min(220, Math.max(48, Math.max((edit.sku ?? "").length, (edit.barcode ?? "").length) * 8 + 26))}px` }}>
+                          <s-text-field
+                            label="SKU"
+                            error={skuDupe ? "SKU already in use" : undefined}
+                            value={edit.sku ?? ""}
+                            onInput={e => setVariant(v.id, "sku", e.currentTarget.value)}
+                            placeholder="—"
+                          />
+                        </div>
+                      </div>
+                      {/* Charge tax */}
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                        <div style={sx.fieldCaption}>Charge tax</div>
+                        <s-checkbox
+                          accessibilityLabel="Charge tax"
+                          checked={edit.taxable ?? true}
+                          onChange={e => setVariant(v.id, "taxable", e.currentTarget.checked)}
+                        />
+                      </div>
+                      {/* Tracked */}
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                        <div style={sx.fieldCaption}>Tracked</div>
+                        <s-checkbox
+                          accessibilityLabel="Inventory tracked"
+                          checked={edit.tracked ?? false}
+                          onChange={e => setVariant(v.id, "tracked", e.currentTarget.checked)}
+                        />
+                      </div>
+                      {/* Physical product */}
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                        <div style={sx.fieldCaption}>Physical product</div>
+                        <s-checkbox
+                          accessibilityLabel="Physical product"
+                          checked={edit.requiresShipping ?? true}
+                          onChange={e => setVariant(v.id, "requiresShipping", e.currentTarget.checked)}
+                        />
+                      </div>
+                      {/* Sell out-of-stock */}
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                        <div style={sx.fieldCaption}>Sell out-of-stock</div>
+                        <s-checkbox
+                          accessibilityLabel="Sell when out of stock"
+                          checked={edit.inventoryPolicy === "CONTINUE"}
+                          onChange={e => setVariant(v.id, "inventoryPolicy", e.currentTarget.checked ? "CONTINUE" : "DENY")}
+                        />
+                      </div>
                     </div>
-                  </div>
-                  {/* Charge tax */}
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-                    <div style={sx.fieldCaption}>Charge tax</div>
-                    <s-checkbox
-                      accessibilityLabel="Charge tax"
-                      checked={edit.taxable ?? true}
-                      onChange={e => setVariant(v.id, "taxable", e.currentTarget.checked)}
-                    />
-                  </div>
-                  {/* Tracked */}
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-                    <div style={sx.fieldCaption}>Tracked</div>
-                    <s-checkbox
-                      accessibilityLabel="Inventory tracked"
-                      checked={edit.tracked ?? false}
-                      onChange={e => setVariant(v.id, "tracked", e.currentTarget.checked)}
-                    />
-                  </div>
-                  {/* Physical product */}
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-                    <div style={sx.fieldCaption}>Physical product</div>
-                    <s-checkbox
-                      accessibilityLabel="Physical product"
-                      checked={edit.requiresShipping ?? true}
-                      onChange={e => setVariant(v.id, "requiresShipping", e.currentTarget.checked)}
-                    />
-                  </div>
-                  {/* Sell out-of-stock */}
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-                    <div style={sx.fieldCaption}>Sell out-of-stock</div>
-                    <s-checkbox
-                      accessibilityLabel="Sell when out of stock"
-                      checked={edit.inventoryPolicy === "CONTINUE"}
-                      onChange={e => setVariant(v.id, "inventoryPolicy", e.currentTarget.checked ? "CONTINUE" : "DENY")}
-                    />
-                  </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {/* ── Variants table — title/subtext · price · inventory columns, for both category and per-variant rows — only when 2+ variants ── */}
+          {variantList.length >= 2 && (
+          <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", marginBottom: 16 }}>
+            {/* Single header row — column labels, plus the open/close toggle for the whole table */}
+            <div
+              role="button"
+              tabIndex={0}
+              onClick={() => {
+                if (variantsMaxLoaded) window.open(productAdminUrl, "_blank", "noopener,noreferrer");
+                else setVariantsSectionOpen(o => !o);
+              }}
+              onKeyDown={e => {
+                if (e.key !== "Enter" && e.key !== " ") return;
+                e.preventDefault();
+                if (variantsMaxLoaded) window.open(productAdminUrl, "_blank", "noopener,noreferrer");
+                else setVariantsSectionOpen(o => !o);
+              }}
+              style={{ display: "flex", alignItems: "center", background: "#fafafa", padding: "10px 14px", cursor: "pointer", userSelect: "none" }}
+            >
+              <div style={{ ...sx.variantTableCols, ...sx.variantTableHeaderRow, flex: 1, minWidth: 0 }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  Variants ({variantsMaxLoaded ? `${VARIANTS_COUNT}+` : variantList.length})
+                  {variantsMaxLoaded && (
+                    <a
+                      href={productAdminUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={e => e.stopPropagation()}
+                      style={sx.badgeMaxLoaded}
+                    >
+                      MAX LOADED ↗
+                    </a>
+                  )}
+                </span>
+                <span style={{ textAlign: "right" }}>Price</span>
+                <span style={{ textAlign: "right" }}>Inventory</span>
+              </div>
+              <span style={{
+                fontSize: 11, color: "#6d7175", padding: "0 0 0 14px", flexShrink: 0,
+                transform: variantsSectionOpen && !variantsMaxLoaded ? "rotate(180deg)" : "none", transition: "transform 0.15s",
+              }}>{variantsMaxLoaded ? "↗" : "▾"}</span>
+            </div>
+
+            {variantsSectionOpen && !variantsMaxLoaded && (() => {
+              const variantGroups = getOrderedVariantGroups(variantList);
+              return (
+                <div style={{ borderTop: "1px solid #e1e3e5", padding: "12px 0", display: "flex", flexDirection: "column", gap: 10 }}>
+                  {variantGroups.map(group => {
+                      const isCollapsed = collapsedGroups.has(group.label);
+                      return (
+                        <div key={group.label} style={sx.groupCard}>
+                          {/* Category row — the 3 table columns, plus the collapse toggle */}
+                          <div
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => toggleGroupCollapsed(group.label)}
+                            onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleGroupCollapsed(group.label); } }}
+                            style={{ display: "flex", alignItems: "center", background: "#f3f3f4", padding: "10px 14px", cursor: "pointer" }}
+                          >
+                            <div style={{ ...sx.variantTableCols, flex: 1, minWidth: 0 }}>
+                              {/* 1. Header: sorting variant title, subtext: # of variants */}
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ fontWeight: 700, fontSize: 13, color: "#202223", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                  {group.value}
+                                </div>
+                                <div style={{ fontSize: 11, color: "#6d7175" }}>
+                                  {group.variants.length} variant{group.variants.length !== 1 ? "s" : ""}
+                                </div>
+                              </div>
+                              {/* 2. Price */}
+                              <div style={{ fontSize: 13, color: "#202223", textAlign: "right" }}>{summarizeGroupPrice(group, variantEdits)}</div>
+                              {/* 3. Inventory */}
+                              <div style={{ fontSize: 13, color: "#202223", textAlign: "right" }}>{summarizeGroupInventory(group, variantEdits)}</div>
+                            </div>
+                            <span style={{
+                              fontSize: 11, color: "#6d7175", padding: "0 0 0 14px", flexShrink: 0,
+                              transform: isCollapsed ? "none" : "rotate(180deg)", transition: "transform 0.15s",
+                            }}>▾</span>
+                          </div>
+
+                          {/* Individual variant rows — same 3 columns */}
+                          {!isCollapsed && (
+                            <div style={{ display: "flex", flexDirection: "column", background: "#fafbfb" }}>
+                              {group.variants.map((v, vIdx) => {
+                                const edit = variantEdits[v.id] ?? {};
+                                // SKU duplicate: typed SKU exists in the collection's loaded SKUs (and isn't the original SKU for this variant)
+                                const skuDupe      = edit.sku && edit.sku !== (v.sku ?? "") && allSkus.has(edit.sku);
+                                const optionsLabel = formatVariantOptions(v, true);
+                                return (
+                                  <div
+                                    key={v.id}
+                                    style={{
+                                      ...sx.variantTableCols,
+                                      padding: "8px 14px",
+                                      borderTop: vIdx > 0 ? "1px solid #eef0f1" : "none",
+                                    }}
+                                  >
+                                    {/* 1. Header: sub variant title, subtext: SKU (editable) */}
+                                    <div style={{ minWidth: 0 }}>
+                                      <div style={{ fontWeight: 600, fontSize: 13, color: "#202223", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                        {optionsLabel ?? v.title}
+                                      </div>
+                                      <input
+                                        value={edit.sku ?? ""}
+                                        onInput={e => setVariant(v.id, "sku", e.currentTarget.value)}
+                                        placeholder="SKU"
+                                        title={skuDupe ? "SKU already in use" : undefined}
+                                        style={{ ...sx.skuSubtextInput, color: skuDupe ? "#d82c0d" : "#6d7175" }}
+                                      />
+                                    </div>
+                                    {/* 2. Price */}
+                                    <s-number-field
+                                      label="Price"
+                                      labelAccessibilityVisibility="exclusive"
+                                      style={{ width: "100%", textAlign: "right" }}
+                                      prefix="$"
+                                      step="0.01"
+                                      min="0"
+                                      value={edit.price ?? ""}
+                                      onInput={e => setVariant(v.id, "price", e.currentTarget.value)}
+                                    />
+                                    {/* 3. Inventory */}
+                                    <div style={{ minWidth: 0 }}>
+                                      <s-number-field
+                                        label="Inventory"
+                                        labelAccessibilityVisibility="exclusive"
+                                        style={{ width: "100%", textAlign: "right" }}
+                                        min="0"
+                                        step="1"
+                                        value={String(edit.inventoryQty ?? 0)}
+                                        onInput={e => setVariant(v.id, "inventoryQty", e.currentTarget.value)}
+                                        disabled={!edit.tracked}
+                                      />
+                                      {edit.locationName && (
+                                        <div style={{ fontSize: 9, color: "#8c9196", marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", textAlign: "right" }}>
+                                          {edit.locationName}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                 </div>
               );
-            })}
+            })()}
           </div>
+          )}
 
           {/* Description — rich text editor */}
           <div style={{ marginBottom: 16 }}>
@@ -2207,6 +2487,7 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
   const createFetcher  = useFetcher();
   const prodSearchF    = useFetcher();
   const removeFetcher  = useFetcher();
+  const singlesFetcher = useFetcher();
   const [query, setQuery]           = useState("");
   const [prodQuery, setProdQuery]   = useState("");
   const [addingProd, setAddingProd] = useState(false);
@@ -2225,6 +2506,10 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
   useEffect(() => {
     if (createFetcher.data?.createdCollection) { onSelect(createFetcher.data.createdCollection); setQuery(""); }
   }, [createFetcher.data]);
+
+  useEffect(() => {
+    if (singlesFetcher.data?.singlesCollection) { onSelect(singlesFetcher.data.singlesCollection); setQuery(""); }
+  }, [singlesFetcher.data]);
 
   useEffect(() => {
     if (removeFetcher.data?.removedFromCollection) {
@@ -2246,6 +2531,18 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
   function handleSelect(c)      { onSelect(c); setQuery(""); }
   function handleDeselect()     { setQuery(""); onDeselect(); }
   function quickCreate(name)    { createFetcher.submit({ intent: "create-collection", title: name.trim() }, { method: "POST" }); }
+
+  function todaySinglesTitle() {
+    const d  = new Date();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const yy = String(d.getFullYear()).slice(-2);
+    return `(Singles)${mm}/${dd}/${yy}`;
+  }
+
+  function handleSingleProduct() {
+    singlesFetcher.submit({ intent: "find-or-create-singles", title: todaySinglesTitle() }, { method: "POST" });
+  }
 
   function removeProduct(productId) {
     setPendingIds(prev => new Set([...prev, productId]));
@@ -2290,6 +2587,21 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
         <div style={sx.sidebarHeader}>
           <span style={{ fontWeight: 700, fontSize: 15, color: "#202223" }}>Collections</span>
           <button style={sx.sidebarCloseBtn} onClick={onToggle} title="Collapse">‹</button>
+        </div>
+
+        {/* ── Single Product quick-collection ── */}
+        <div style={{ padding: "12px 16px 0" }}>
+          <button
+            type="button"
+            style={sx.sidebarCreateBtn}
+            onClick={handleSingleProduct}
+            disabled={singlesFetcher.state !== "idle"}
+          >
+            {singlesFetcher.state !== "idle" ? "Loading…" : "Single Product"}
+          </button>
+          {singlesFetcher.data?.singlesError && (
+            <div style={{ fontSize: 12, color: "#d82c0d", marginTop: 6 }}>{singlesFetcher.data.singlesError}</div>
+          )}
         </div>
 
         {/* ── No collection selected: show search ── */}
@@ -2439,13 +2751,11 @@ export default function PrepB() {
 
   const [listSearch, setListSearch]   = useState("");
   const [listSort,   setListSort]     = useState("default");
-  const [listVendor, setListVendor]   = useState("");
 
   // Reset filters when collection changes
   useEffect(() => {
     setListSearch("");
     setListSort("default");
-    setListVendor("");
   }, [collection?.id]);
 
   const allSkus = useMemo(() => {
@@ -2464,11 +2774,6 @@ export default function PrepB() {
   const typeSuggest   = usePaginatedSuggestions("type",   typeSuggestions);
   const tagSuggest    = usePaginatedSuggestions("tag",    tagSuggestions);
 
-  const vendors = useMemo(() => {
-    const set = new Set(products.map(p => p.vendor).filter(v => v && v !== "0"));
-    return [...set].sort();
-  }, [products]);
-
   const filteredProducts = useMemo(() => {
     let list = [...products];
     if (listSearch.trim()) {
@@ -2478,7 +2783,6 @@ export default function PrepB() {
         p.variants?.edges?.some(e => e.node.sku?.toLowerCase().includes(q))
       );
     }
-    if (listVendor) list = list.filter(p => p.vendor === listVendor);
     if (listSort === "title-asc")   list.sort((a, b) => (a.title ?? "").localeCompare(b.title ?? ""));
     if (listSort === "title-desc")  list.sort((a, b) => (b.title ?? "").localeCompare(a.title ?? ""));
     if (listSort === "sku-asc")     list.sort((a, b) => (a.variants?.edges?.[0]?.node?.sku ?? "").localeCompare(b.variants?.edges?.[0]?.node?.sku ?? ""));
@@ -2486,9 +2790,9 @@ export default function PrepB() {
     if (listSort === "price-asc")   list.sort((a, b) => parseFloat(a.variants?.edges?.[0]?.node?.price ?? 0) - parseFloat(b.variants?.edges?.[0]?.node?.price ?? 0));
     if (listSort === "price-desc")  list.sort((a, b) => parseFloat(b.variants?.edges?.[0]?.node?.price ?? 0) - parseFloat(a.variants?.edges?.[0]?.node?.price ?? 0));
     return list;
-  }, [products, listSearch, listSort, listVendor]);
+  }, [products, listSearch, listSort]);
 
-  const isFiltered = listSearch.trim() || listVendor || listSort !== "default";
+  const isFiltered = listSearch.trim() || listSort !== "default";
 
   const bulkEditUrl = (() => {
     if (!collection || !shop) return null;
@@ -2552,16 +2856,6 @@ export default function PrepB() {
                     onChange={e => setListSearch(e.target.value)}
                     placeholder="Search by title or SKU…"
                   />
-                  {vendors.length > 1 && (
-                    <select
-                      style={{ ...sx.select, width: "auto", flex: "0 0 auto", minWidth: 110 }}
-                      value={listVendor}
-                      onChange={e => setListVendor(e.target.value)}
-                    >
-                      <option value="">All vendors</option>
-                      {vendors.map(v => <option key={v} value={v}>{v}</option>)}
-                    </select>
-                  )}
                   <select
                     style={{ ...sx.select, width: "auto", flex: "0 0 auto", minWidth: 140 }}
                     value={listSort}
@@ -2578,7 +2872,7 @@ export default function PrepB() {
                   {isFiltered && (
                     <button
                       style={{ ...sx.discardBtn, padding: "6px 12px", fontSize: 12, flexShrink: 0 }}
-                      onClick={() => { setListSearch(""); setListVendor(""); setListSort("default"); }}
+                      onClick={() => { setListSearch(""); setListSort("default"); }}
                     >
                       Clear
                     </button>
@@ -2743,6 +3037,22 @@ const sx = {
     display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr",
     alignItems: "start", padding: "10px 12px", gap: 10,
   },
+  groupCard: {
+    border: "1px solid #e1e3e5", borderRadius: 8, overflow: "hidden", background: "#fff",
+  },
+  // Shared 3-column layout for the variants table: title+subtext · price · inventory.
+  variantTableCols: {
+    display: "grid", gridTemplateColumns: "minmax(0,1fr) 100px 100px",
+    alignItems: "center", gap: 10,
+  },
+  // Text styling layered on top of variantTableCols for the header row specifically.
+  variantTableHeaderRow: {
+    fontSize: 11, fontWeight: 700, color: "#6d7175", textTransform: "uppercase", letterSpacing: "0.4px",
+  },
+  skuSubtextInput: {
+    fontSize: 11, color: "#6d7175", border: "none", outline: "none",
+    background: "transparent", padding: 0, width: "100%", fontFamily: "inherit",
+  },
   fieldCaption: { fontSize: 11, fontWeight: 600, color: "#202223", textAlign: "center", marginBottom: 4 },
   variantHead: { fontSize: 11, fontWeight: 700, color: "#202223", textTransform: "uppercase", letterSpacing: "0.4px" },
   errorBox: {
@@ -2752,6 +3062,11 @@ const sx = {
   warningBox: {
     background: "#fffbea", border: "1px solid #ffc453", borderRadius: 6,
     padding: "10px 14px", fontSize: 13, color: "#7d5a00", marginBottom: 12,
+  },
+  badgeMaxLoaded: {
+    background: "#fff3cd", color: "#856404", fontSize: 9, fontWeight: 700, letterSpacing: "0.3px",
+    padding: "2px 6px", borderRadius: 999, border: "1px solid #ffc107", textTransform: "none",
+    textDecoration: "none", cursor: "pointer",
   },
   badgeDirty:  { background: "#fff3cd", color: "#856404", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, border: "1px solid #ffc107" },
   badgeSaved:  { background: "#d4edda", color: "#155724", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, border: "1px solid #c3e6cb" },
