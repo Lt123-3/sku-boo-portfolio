@@ -35,31 +35,31 @@ model SkuLog {
   productId       String
   title           String
   imageUrl        String?
-  shopId          String?                              // which store
-  skuNumber       String?                              // mirrors SkuIndex.skuNumber
-  status          String?  @default("active")          // free | active | reserved | problem | deleted
-  warehouseStatus String?                              // reserved for future warehouse features
-  problems        String?                              // JSON array
-  createdBy       String?                              // userId of who generated it
+  shopId          String? // which store
+  skuNumber       String? // mirrors SkuIndex.skuNumber
+  status          String?  @default("active") // free | active | reserved | problem | deleted
+  warehouseStatus String? // reserved for future warehouse features
+  problems        String? // JSON array
+  createdBy       String? // userId of who generated it
   createdAt       DateTime @default(now())
 }
 
 model SkuIndex {
-  id              Int       @id @default(autoincrement())
-  shopId          String
-  skuNumber       String    @unique
-  taken           Boolean   @default(false)
-  titleTaken      Boolean   @default(false)
-  productId       String?
-  title           String?
-  status          String    @default("free")           // free | active | reserved | problem | deleted
-  problems        String?                              // JSON array e.g. '["no_title","no_pic"]'
-  excludedProblems String?                             // JSON array — problems permanently excluded from detection
-  warehouseStatus String?                              // reserved for future warehouse features
-  reservedAt      DateTime?                            // stores Shopify product.createdAt on sync
-  reservedBy      String?                              // access key of the user who reserved it
-  syncedAt        DateTime?                            // when we last synced this row
-  updatedAt       DateTime  @updatedAt
+  id               Int       @id @default(autoincrement())
+  shopId           String
+  skuNumber        String    @unique
+  taken            Boolean   @default(false)
+  titleTaken       Boolean   @default(false)
+  productId        String?
+  title            String?
+  status           String    @default("free") // free | active | reserved | problem | deleted
+  problems         String? // JSON array e.g. '["no_title","no_pic"]'
+  excludedProblems String? // JSON array — problems permanently excluded from detection
+  warehouseStatus  String? // reserved for future warehouse features
+  reservedAt       DateTime? // stores Shopify product.createdAt on sync
+  reservedBy       String? // access key of the user who reserved it
+  syncedAt         DateTime? // when we last synced this row
+  updatedAt        DateTime  @updatedAt
 
   @@index([shopId])
   @@index([status])
@@ -73,7 +73,8 @@ model AccessKey {
   shopId    String
   userId    String
   username  String   @default("admin")
-  role      String   @default("operator")             // viewer | operator | admin
+  initials  String? // 1-4 letters, lowercase — used to name auto-created collections
+  role      String   @default("operator") // viewer | operator | admin
   active    Boolean  @default(true)
   createdAt DateTime @default(now())
 
@@ -97,21 +98,21 @@ model SkuSession {
 }
 
 model ProductInfo {
-  id          Int      @id @default(autoincrement())
+  id          Int       @id @default(autoincrement())
   shopId      String
-  productId   String   @unique                        // one row per product, upserted on sync
+  productId   String    @unique // one row per product, upserted on sync
   skuNumber   String?
   title       String?
   vendor      String?
-  price       String?                                 // stored as string to preserve decimals
-  weight      String?                                 // stored as string with unit
-  condition   String?                                 // custom.ebay_condition_id metafield
-  inventory   String?                                 // JSON — {locationId: quantity}
-  collections String?                                 // JSON array of collection titles
+  price       String? // stored as string to preserve decimals
+  weight      String? // stored as string with unit
+  condition   String? // custom.ebay_condition_id metafield
+  inventory   String? // JSON — {locationId: quantity}
+  collections String? // JSON array of collection titles
   imageUrl    String?
   imageCount  Int?
-  notes       String?                                 // JSON append-only array of {userId, username, text, timestamp}
-  updatedAt   DateTime @updatedAt
+  notes       String? // JSON append-only array of {userId, username, text, timestamp}
+  updatedAt   DateTime  @updatedAt
   syncedAt    DateTime?
 
   @@index([shopId])
@@ -120,15 +121,15 @@ model ProductInfo {
 }
 
 model SkuHistory {
-  id         Int      @id @default(autoincrement())
-  shopId     String
-  productId  String
-  skuNumber  String?
-  field      String                                   // title | price | vendor | weight | condition | inventory | collections | image
-  oldValue   String?
-  newValue   String?
-  changedAt  DateTime @default(now())
-  changedBy  String   @default("system")              // userId or "system"
+  id        Int      @id @default(autoincrement())
+  shopId    String
+  productId String
+  skuNumber String?
+  field     String // title | price | vendor | weight | condition | inventory | collections | image
+  oldValue  String?
+  newValue  String?
+  changedAt DateTime @default(now())
+  changedBy String   @default("system") // userId or "system"
 
   @@index([shopId])
   @@index([productId])
@@ -145,8 +146,8 @@ model SyncState {
   currentPass Int?
   processed   Int       @default(0)
   total       Int       @default(0)
-  cursor      String?                    
-  startTime   DateTime?                  
+  cursor      String?
+  startTime   DateTime?
   lastCronRun DateTime?
   lastError   String?
   startedAt   DateTime?
@@ -160,8 +161,8 @@ model ProblemLog {
   shopId      String
   productId   String
   skuNumber   String?
-  action      String   // "detected" | "passed" | "excluded" | "resolved" | "deleted"
-  problemType String?  // "no_sku" | "no_title" | "no_title_body" | "no_pic" | "no_prep" | null
+  action      String // "detected" | "passed" | "excluded" | "resolved" | "deleted"
+  problemType String? // "no_sku" | "no_title" | "no_title_body" | "no_pic" | "no_prep" | null
   changedBy   String   @default("system")
   note        String?
   createdAt   DateTime @default(now())
@@ -170,4 +171,112 @@ model ProblemLog {
   @@index([productId])
   @@index([skuNumber])
   @@index([shopId, createdAt])
+}
+
+// ── Per-person, per-day counter backing the "New Collection" button in Prep —
+// collections are auto-named {initials}{MM/DD/YY}({N}), where N is this
+// counter, atomically incremented so concurrent clicks never collide ────────
+model CollectionSequence {
+  id       Int    @id @default(autoincrement())
+  shopId   String
+  initials String
+  date     String // "MM/DD/YY", matches the collection title format exactly
+  count    Int    @default(0)
+
+  @@unique([shopId, initials, date])
+}
+
+// ── Shared "source of truth" for Saved Packages, read by both the Chrome
+// extension and the ESP32 shipping-desk device ──────────────────────────────
+model SavedPackage {
+  id        Int      @id @default(autoincrement())
+  shopId    String
+  name      String
+  length    Float // inches
+  width     Float // inches
+  height    Float? // inches; null if not recorded
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shopId, name])
+  @@index([shopId])
+}
+
+// ── Rate-check savings ledger: one row per order the extension actually
+// computed a rate for, so savings from weight comparisons can be tracked
+// over time ──────────────────────────────────────────────────────────────
+model OrderSaving {
+  id               Int      @id @default(autoincrement())
+  shopId           String
+  shopifyOrderId   String // Order GID
+  orderName        String // e.g. "#4337"
+  originalWeightLb Float
+  ogPrice          Float
+  twoLbPrice       Float
+  createdAt        DateTime @default(now())
+
+  @@index([shopId])
+  @@index([shopifyOrderId])
+}
+
+// ── AI generation settings: one row per shop, holding the Claude API key
+// (encrypted at rest — see app/lib/crypto.server.js) and the system prompts
+// used by the Prep page's Generate/Regenerate buttons ─────────────────────
+model AiSettings {
+  id                      Int      @id @default(autoincrement())
+  shopId                  String   @unique
+  apiKeyEncrypted         String?
+  titleSystemPrompt       String?
+  descriptionSystemPrompt String?
+  model                   String   @default("claude-sonnet-5")
+  webSearchEnabled        Boolean  @default(false)
+  updatedBy               String?
+  updatedAt               DateTime @updatedAt
+  createdAt               DateTime @default(now())
+}
+
+// ── AI usage log: one row per Claude API call from the Prep page's
+// Generate/Regenerate buttons (writer calls) and the shared comparable-
+// listings research call, for basic in-app cost visibility. Insert-only,
+// logged best-effort — a logging failure must never block generation
+// (see logAiUsageSafely in ai.server.js) ───────────────────────────────
+model AiUsageLog {
+  id                  Int      @id @default(autoincrement())
+  shopId              String
+  callType            String // "title" | "description" | "research"
+  model               String // e.g. "claude-haiku-4-5"
+  inputTokens         Int      @default(0)
+  outputTokens        Int      @default(0)
+  cacheReadTokens     Int      @default(0)
+  cacheCreationTokens Int      @default(0)
+  webSearchCount      Int      @default(0) // usage.server_tool_use.web_search_requests — actual searches used, out of the max_uses ceiling
+  createdAt           DateTime @default(now())
+
+  @@index([shopId])
+  @@index([shopId, createdAt])
+  @@index([callType])
+}
+
+// ── In-flight ESP submission: written by the WebSocket relay when the ESP
+// submits an order+package+weight, read by the extension (ext-api.pending-
+// submission), filled in by the extension (ext-api.report-rate) once a rate
+// is computed, and polled by the relay so it can push the result back down
+// the still-open WebSocket connection. This table *is* the shared truth
+// between the two processes — no direct process-to-process link needed.
+model PendingSubmission {
+  id          Int       @id @default(autoincrement())
+  shopId      String
+  orderId     String // Order GID
+  orderName   String
+  packageName String
+  weightLb    Float
+  address     String // JSON-serialized shipping address
+  lineItems   String // JSON-serialized line items
+  rate        Float? // null until the extension reports back
+  ratedAt     DateTime?
+  deliveredAt DateTime? // set once the relay pushes it to the ESP
+  createdAt   DateTime  @default(now())
+
+  @@index([shopId])
+  @@index([orderId])
 }

@@ -6,6 +6,10 @@ import { useRouteError, useLoaderData, useFetcher, useSearchParams } from "react
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import { generateProductText } from "../lib/ai.server.js";
+import { PinOverlay, UserBadge, useSkuSession } from "../components/PinGate.jsx";
+import { validateSkuSession } from "../lib/access.server.js";
+import prisma from "../db.server.js";
 
 const RECENT_COUNT   = 20;
 const SIDEBAR_WIDTH  = 260;
@@ -85,23 +89,6 @@ const EBAY_CONDITIONS = [
 function gcd(a, b) { return b === 0 ? a : gcd(b, a % b); }
 function aspectRatio(w, h) { const d = gcd(w, h); return `${w / d}:${h / d}`; }
 
-function htmlToText(html) {
-  if (!html) return "";
-  return html
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<\/div>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 function textToHtml(text) {
   if (!text) return "";
   const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -110,6 +97,13 @@ function textToHtml(text) {
     .filter(p => p.trim())
     .map(p => `<p>${p.replace(/\n/g, "<br>")}</p>`)
     .join("");
+}
+
+function formatMMDDYY(date) {
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  const yy = String(date.getFullYear()).slice(-2);
+  return `${mm}/${dd}/${yy}`;
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -222,10 +216,62 @@ export const loader = async ({ request }) => {
   return { recentCollections, collection, products, vendorSuggestions, typeSuggestions, tagSuggestions, shop };
 };
 
+// Auto-generated collection name for the "New Collection" button:
+// {initials}{MM/DD/YY}({N}) — N is a per-person, per-day counter, atomically
+// incremented so two rapid clicks never produce the same name.
+async function nextCollectionTitle(shopId, initials) {
+  const date = formatMMDDYY(new Date());
+
+  const seq = await prisma.collectionSequence.upsert({
+    where:  { shopId_initials_date: { shopId, initials, date } },
+    create: { shopId, initials, date, count: 1 },
+    update: { count: { increment: 1 } },
+  });
+
+  return `${initials}${date}(${seq.count})`;
+}
+
+// Resolves a client-held sessionId to the caller's AccessKey row (which
+// carries their initials), or null if the session is missing/expired.
+async function resolveAccessKey(shopId, sessionId) {
+  const skuSession = await validateSkuSession({ sessionId, shopId });
+  if (!skuSession) return null;
+  return prisma.accessKey.findUnique({
+    where: { shopId_userId: { shopId, userId: skuSession.userId } },
+  });
+}
+
 export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const shopId     = session.shop;
   const form       = await request.formData();
   const intent     = form.get("intent");
+
+  // ── AI-generate title / description ───────────────────────────────────────
+  if (intent === "generate-title" || intent === "generate-description") {
+    const kind = intent === "generate-title" ? "title" : "description";
+    try {
+      const { text, comparableResearch } = await generateProductText({
+        shopId,
+        kind,
+        productContext: {
+          title:        form.get("title") ?? "",
+          vendor:       form.get("vendor") ?? "",
+          productType:  form.get("productType") ?? "",
+          condition:    form.get("condition") ?? "",
+          bodyHtml:     form.get("bodyHtml") ?? "",
+          tags:         form.get("tags") ?? "",
+          categoryName: form.get("categoryName") ?? "",
+        },
+        additionalInstruction: form.get("additionalPrompt") ?? "",
+        comparableResearch: form.get("comparableResearch") || undefined,
+      });
+      return { success: true, kind, text, comparableResearch };
+    } catch (err) {
+      console.error("[prepb] AI generate failed:", err);
+      return { success: false, kind, error: err.message };
+    }
+  }
 
   // ── Search collections ────────────────────────────────────────────────────
   if (intent === "search") {
@@ -688,6 +734,56 @@ export const action = async ({ request }) => {
     }
   }
 
+  // ── Rename collection ─────────────────────────────────────────────────────
+  if (intent === "rename-collection") {
+    const collectionId = form.get("collectionId") ?? "";
+    const title = form.get("title") ?? "";
+    if (!collectionId) return { renameError: "Missing collection." };
+    if (!title.trim()) return { renameError: "Collection name is required." };
+    try {
+      const res = await admin.graphql(
+        `#graphql
+        mutation renameCollection($input: CollectionInput!) {
+          collectionUpdate(input: $input) {
+            collection { id title }
+            userErrors { field message }
+          }
+        }`,
+        { variables: { input: { id: collectionId, title: title.trim() } } }
+      );
+      const data = await res.json();
+      const errs = data.data?.collectionUpdate?.userErrors ?? [];
+      if (errs.length > 0) return { renameError: errs[0].message };
+      return { renamedCollection: data.data.collectionUpdate.collection };
+    } catch (err) {
+      return { renameError: String(err) };
+    }
+  }
+
+  // ── Delete collection ──────────────────────────────────────────────────────
+  if (intent === "delete-collection") {
+    const collectionId = form.get("collectionId") ?? "";
+    if (!collectionId) return { deleteError: "Missing collection." };
+    try {
+      const res = await admin.graphql(
+        `#graphql
+        mutation deleteCollection($input: CollectionDeleteInput!) {
+          collectionDelete(input: $input) {
+            deletedCollectionId
+            userErrors { field message }
+          }
+        }`,
+        { variables: { input: { id: collectionId } } }
+      );
+      const data = await res.json();
+      const errs = data.data?.collectionDelete?.userErrors ?? [];
+      if (errs.length > 0) return { deleteError: errs[0].message };
+      return { deletedCollectionId: data.data.collectionDelete.deletedCollectionId };
+    } catch (err) {
+      return { deleteError: String(err) };
+    }
+  }
+
   // ── Find or create today's "Singles" collection ───────────────────────────
   if (intent === "find-or-create-singles") {
     const title = (form.get("title") ?? "").trim();
@@ -723,6 +819,71 @@ export const action = async ({ request }) => {
       return { singlesCollection: createData.data.collectionCreate.collection };
     } catch (err) {
       return { singlesError: String(err) };
+    }
+  }
+
+  // ── Create a new collection with an auto-generated name ───────────────────
+  if (intent === "create-named-collection") {
+    const sessionId = form.get("sessionId")?.toString();
+    const accessKey = await resolveAccessKey(shopId, sessionId);
+    if (!accessKey) return { namedCollectionError: "Please sign in again." };
+    if (!accessKey.initials) {
+      return { namedCollectionError: "Your account has no initials set — ask an admin to add them in the Admin panel." };
+    }
+
+    const title = await nextCollectionTitle(shopId, accessKey.initials);
+
+    try {
+      const res = await admin.graphql(
+        `#graphql
+        mutation createNamedCollection($input: CollectionInput!) {
+          collectionCreate(input: $input) {
+            collection { id title productsCount { count } }
+            userErrors { field message }
+          }
+        }`,
+        { variables: { input: { title } } }
+      );
+      const data = await res.json();
+      const errs = data.data?.collectionCreate?.userErrors ?? [];
+      if (errs.length > 0) return { namedCollectionError: errs[0].message };
+      return { createdNamedCollection: data.data.collectionCreate.collection };
+    } catch (err) {
+      return { namedCollectionError: String(err) };
+    }
+  }
+
+  // ── Suggest this user's own collections: today's, else their recent ──────
+  if (intent === "suggest-my-collections") {
+    const sessionId = form.get("sessionId")?.toString();
+    const accessKey = await resolveAccessKey(shopId, sessionId);
+    if (!accessKey) return { suggestedCollections: [], suggestMode: null, suggestError: "Please sign in again." };
+    if (!accessKey.initials) {
+      return { suggestedCollections: [], suggestMode: null, suggestError: "Your account has no initials set — ask an admin to add them in the Admin panel." };
+    }
+
+    const initials = accessKey.initials;
+    const today    = formatMMDDYY(new Date());
+
+    try {
+      const res = await admin.graphql(
+        `#graphql
+        query searchMyCollections($first: Int!, $query: String!) {
+          collections(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) {
+            edges { node { id title productsCount { count } } }
+          }
+        }`,
+        { variables: { query: initials, first: 50 } }
+      );
+      const data = await res.json();
+      const mine = (data.data?.collections?.edges?.map(e => e.node) ?? [])
+        .filter(c => c.title.startsWith(initials));
+      const todays = mine.filter(c => c.title.startsWith(`${initials}${today}`));
+
+      if (todays.length > 0) return { suggestedCollections: todays, suggestMode: "today" };
+      return { suggestedCollections: mine.slice(0, 10), suggestMode: "recent" };
+    } catch (err) {
+      return { suggestedCollections: [], suggestMode: null, suggestError: String(err) };
     }
   }
 
@@ -1466,11 +1627,52 @@ function ImageManager({ images, onUpdate }) {
 }
 
 // ── Field wrapper ─────────────────────────────────────────────────────────────
-function Field({ label, children, span }) {
+function Field({ label, children, span, actions }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4, gridColumn: span ? "1 / -1" : undefined }}>
-      <label style={sx.label}>{label}</label>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+        <label style={sx.label}>{label}</label>
+        {actions}
+      </div>
       {children}
+    </div>
+  );
+}
+
+// AI Generate/Regenerate controls for the Title and Description fields —
+// calls Claude via the "generate-title" / "generate-description" action
+// intents using the shop's stored system prompt, plus an optional one-off
+// instruction typed in via "+ Prompt".
+function AiFieldActions({
+  hasValue, isGenerating, promptOpen, promptValue, error,
+  onTogglePrompt, onPromptChange, onGenerate,
+}) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+        {promptOpen && (
+          <input
+            style={sx.aiPromptInput}
+            placeholder="Extra instruction (optional)"
+            value={promptValue}
+            onChange={e => onPromptChange(e.target.value)}
+          />
+        )}
+        <button type="button" style={sx.aiGhostBtn} onClick={onTogglePrompt}>
+          {promptOpen ? "Hide prompt" : "+ Prompt"}
+        </button>
+        <button
+          type="button"
+          style={{ ...sx.aiBtn, opacity: isGenerating ? 0.6 : 1, cursor: isGenerating ? "default" : "pointer" }}
+          disabled={isGenerating}
+          onClick={onGenerate}
+        >
+          {isGenerating ? "Generating…" : hasValue ? "↺ Regenerate" : "✨ Generate"}
+        </button>
+      </div>
+      {error && (
+        <div style={{ fontSize: 11, color: "#d82c0d", maxWidth: 260, textAlign: "right" }}>{error}</div>
+      )}
     </div>
   );
 }
@@ -1578,6 +1780,7 @@ function ProductRow({
   const REMOVE_DELAY_MS = 3500;
   const fetcher       = useFetcher();
   const removeFetcher  = useFetcher();
+  const aiFetcher      = useFetcher();
   const removeTimerRef = useRef(null);
   const removeIntervalRef = useRef(null);
   const [open, setOpen]             = useState(false);
@@ -1586,9 +1789,33 @@ function ProductRow({
   const [secondsLeft, setSecondsLeft] = useState(Math.ceil(REMOVE_DELAY_MS / 1000));
   const savingRef = useRef(null);
 
+  // AI generate/regenerate — one fetcher shared by Title and Description,
+  // keyed by "kind" so each field tracks its own busy/prompt-box/error state.
+  const [aiExtra,      setAiExtra]      = useState({ title: "", description: "" });
+  const [aiPromptOpen, setAiPromptOpen] = useState({ title: false, description: false });
+  const [aiGenerating, setAiGenerating] = useState(null); // "title" | "description" | null
+  const [aiError,      setAiError]      = useState({ title: null, description: null });
+  // Cached comparable-listings research for THIS product — set from
+  // whichever of title/description generates first, then sent along on the
+  // other click so research only runs once per product per session.
+  const [comparableResearch, setComparableResearch] = useState(null);
+
   useEffect(() => {
     if (removeFetcher.data?.removedFromCollection) { setRemoved(true); onRemoved?.(); }
   }, [removeFetcher.data]);
+
+  useEffect(() => {
+    if (!aiFetcher.data || aiFetcher.state !== "idle") return;
+    const { success, kind, text, error, comparableResearch: newResearch } = aiFetcher.data;
+    if (success) {
+      setField(kind === "title" ? "title" : "bodyHtml", text);
+      setAiError(p => ({ ...p, [kind]: null }));
+      if (newResearch) setComparableResearch(newResearch);
+    } else {
+      setAiError(p => ({ ...p, [kind]: error ?? "Generation failed." }));
+    }
+    setAiGenerating(null);
+  }, [aiFetcher.data, aiFetcher.state]);
 
   useEffect(() => () => clearInterval(removeIntervalRef.current), []);
 
@@ -1726,6 +1953,27 @@ function ProductRow({
 
   function setField(k, v)       { setProductFields(p => ({ ...p, [k]: v })); }
   function setVariant(id, k, v) { setVariantEdits(p => ({ ...p, [id]: { ...p[id], [k]: v } })); }
+
+  function handleGenerate(kind) {
+    setAiGenerating(kind);
+    setAiError(p => ({ ...p, [kind]: null }));
+    aiFetcher.submit(
+      {
+        intent:          kind === "title" ? "generate-title" : "generate-description",
+        productId:       product.id,
+        title:           productFields.title,
+        vendor:          productFields.vendor,
+        productType:     productFields.productType,
+        condition:       productFields.condition,
+        bodyHtml:        productFields.bodyHtml,
+        tags:            tags.join(","),
+        categoryName:    category.name,
+        additionalPrompt: aiExtra[kind],
+        comparableResearch: comparableResearch ?? "",
+      },
+      { method: "POST" }
+    );
+  }
 
   function handleDiscard() {
     setProductFields({ ...baseProductFields });
@@ -1940,7 +2188,22 @@ function ProductRow({
 
           {/* Title — full width, header-style */}
           <div style={{ marginBottom: 12 }}>
-            <Field label="Title">
+            <Field
+              label="Title"
+              actions={
+                <AiFieldActions
+                  kind="title"
+                  hasValue={!!productFields.title}
+                  isGenerating={aiGenerating === "title"}
+                  promptOpen={aiPromptOpen.title}
+                  promptValue={aiExtra.title}
+                  error={aiError.title}
+                  onTogglePrompt={() => setAiPromptOpen(p => ({ ...p, title: !p.title }))}
+                  onPromptChange={v => setAiExtra(p => ({ ...p, title: v }))}
+                  onGenerate={() => handleGenerate("title")}
+                />
+              }
+            >
               <s-text-field
                 label="Title"
                 labelAccessibilityVisibility="exclusive"
@@ -2307,7 +2570,23 @@ function ProductRow({
 
           {/* Description — rich text editor */}
           <div style={{ marginBottom: 16 }}>
-            <Field label="Description" span>
+            <Field
+              label="Description"
+              span
+              actions={
+                <AiFieldActions
+                  kind="description"
+                  hasValue={!!productFields.bodyHtml}
+                  isGenerating={aiGenerating === "description"}
+                  promptOpen={aiPromptOpen.description}
+                  promptValue={aiExtra.description}
+                  error={aiError.description}
+                  onTogglePrompt={() => setAiPromptOpen(p => ({ ...p, description: !p.description }))}
+                  onPromptChange={v => setAiExtra(p => ({ ...p, description: v }))}
+                  onGenerate={() => handleGenerate("description")}
+                />
+              }
+            >
               <RichTextEditor
                 content={productFields.bodyHtml}
                 onChange={html => setField("bodyHtml", html)}
@@ -2482,15 +2761,18 @@ function AddProductsRow({ collectionId, onAdded }) {
 }
 
 // ── CollectionSidebar — floating left panel ───────────────────────────────────
-function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, open, onToggle, onProductsChanged, onJumpToProduct }) {
+function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, open, onToggle, onProductsChanged, onJumpToProduct, skuSession }) {
   const searchFetcher  = useFetcher();
   const createFetcher  = useFetcher();
   const prodSearchF    = useFetcher();
   const removeFetcher  = useFetcher();
   const singlesFetcher = useFetcher();
+  const namedFetcher   = useFetcher();
+  const suggestFetcher = useFetcher();
   const [query, setQuery]           = useState("");
   const [prodQuery, setProdQuery]   = useState("");
   const [addingProd, setAddingProd] = useState(false);
+  const [suggestSort, setSuggestSort] = useState("newest");
   const [removedIds, setRemovedIds]           = useState(new Set());
   const [pendingIds, setPendingIds]           = useState(new Set());
   const pendingTimers                         = useRef({});
@@ -2512,6 +2794,10 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
   }, [singlesFetcher.data]);
 
   useEffect(() => {
+    if (namedFetcher.data?.createdNamedCollection) { onSelect(namedFetcher.data.createdNamedCollection); setQuery(""); }
+  }, [namedFetcher.data]);
+
+  useEffect(() => {
     if (removeFetcher.data?.removedFromCollection) {
       const pid = removeFetcher.data.productId;
       setRemovedIds(prev => new Set([...prev, pid]));
@@ -2526,6 +2812,14 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
 
   useEffect(() => { setRemovedIds(new Set()); setPendingIds(new Set()); }, [products]);
 
+  // Refresh suggestions whenever we return to the idle (no-collection) view,
+  // so a collection created/renamed during this visit shows up on deselect.
+  useEffect(() => {
+    if (skuSession?.sessionId && !activeCollection) {
+      suggestFetcher.submit({ intent: "suggest-my-collections", sessionId: skuSession.sessionId }, { method: "POST" });
+    }
+  }, [skuSession?.sessionId, !!activeCollection]);
+
   function handleCollSearch(e) { const v = e.target.value; setQuery(v); debouncedCollSearch(v); }
   function handleProdSearch(e)  { const v = e.target.value; setProdQuery(v); debouncedProdSearch(v); }
   function handleSelect(c)      { onSelect(c); setQuery(""); }
@@ -2533,15 +2827,18 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
   function quickCreate(name)    { createFetcher.submit({ intent: "create-collection", title: name.trim() }, { method: "POST" }); }
 
   function todaySinglesTitle() {
-    const d  = new Date();
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    const dd = String(d.getDate()).padStart(2, "0");
-    const yy = String(d.getFullYear()).slice(-2);
-    return `(Singles)${mm}/${dd}/${yy}`;
+    return `(Singles)${formatMMDDYY(new Date())}`;
   }
 
   function handleSingleProduct() {
     singlesFetcher.submit({ intent: "find-or-create-singles", title: todaySinglesTitle() }, { method: "POST" });
+  }
+
+  function handleNewCollection() {
+    namedFetcher.submit(
+      { intent: "create-named-collection", sessionId: skuSession?.sessionId ?? "" },
+      { method: "POST" }
+    );
   }
 
   function removeProduct(productId) {
@@ -2576,6 +2873,14 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
   const showCollRes  = query.length >= 2 && !isCollSearch && collResults !== null;
   const visibleProds = (products ?? []).filter(p => !removedIds.has(p.id));
 
+  const suggested     = Array.isArray(suggestFetcher.data?.suggestedCollections) ? suggestFetcher.data.suggestedCollections : [];
+  const suggestMode   = suggestFetcher.data?.suggestMode ?? null;
+  const suggestError  = suggestFetcher.data?.suggestError ?? null;
+  const isSuggesting  = suggestFetcher.state !== "idle" && !suggestFetcher.data;
+  const sortedSuggested = suggestSort === "name"
+    ? [...suggested].sort((a, b) => a.title.localeCompare(b.title))
+    : suggested;
+
   return (
     <>
       {!open && (
@@ -2587,6 +2892,22 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
         <div style={sx.sidebarHeader}>
           <span style={{ fontWeight: 700, fontSize: 15, color: "#202223" }}>Collections</span>
           <button style={sx.sidebarCloseBtn} onClick={onToggle} title="Collapse">‹</button>
+        </div>
+
+        {/* ── New Collection — auto-named {initials}{MM/DD/YY}(N) ── */}
+        <div style={{ padding: "12px 16px 0" }}>
+          <button
+            type="button"
+            style={sx.sidebarCreateBtn}
+            onClick={handleNewCollection}
+            disabled={namedFetcher.state !== "idle" || !skuSession}
+            title={!skuSession ? "Sign in to create a collection" : undefined}
+          >
+            {namedFetcher.state !== "idle" ? "Creating…" : "＋ New Collection"}
+          </button>
+          {namedFetcher.data?.namedCollectionError && (
+            <div style={{ fontSize: 12, color: "#d82c0d", marginTop: 6 }}>{namedFetcher.data.namedCollectionError}</div>
+          )}
         </div>
 
         {/* ── Single Product quick-collection ── */}
@@ -2610,6 +2931,42 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
             <label style={sx.label}>Search Collections</label>
             <input style={{ ...sx.input, marginTop: 4 }} value={query} onChange={handleCollSearch}
               placeholder="Search or create…" autoFocus={open} />
+
+            {query.length < 2 && skuSession && (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "#6d7175", textTransform: "uppercase" }}>
+                    {suggestMode === "recent" ? "Your Recent Collections" : "Your Collections Today"}
+                  </span>
+                  {sortedSuggested.length > 1 && (
+                    <select
+                      style={{ ...sx.select, width: "auto", fontSize: 11, padding: "2px 4px" }}
+                      value={suggestSort}
+                      onChange={e => setSuggestSort(e.target.value)}
+                    >
+                      <option value="newest">Newest</option>
+                      <option value="name">Name A→Z</option>
+                    </select>
+                  )}
+                </div>
+                <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden" }}>
+                  {isSuggesting && <div style={sx.dropItem}>Loading…</div>}
+                  {!isSuggesting && suggestError && (
+                    <div style={{ ...sx.dropItem, color: "#d82c0d" }}>{suggestError}</div>
+                  )}
+                  {!isSuggesting && !suggestError && sortedSuggested.length === 0 && (
+                    <div style={sx.dropItem}>No collections yet — create one above.</div>
+                  )}
+                  {!isSuggesting && sortedSuggested.map(c => (
+                    <div key={c.id} style={sx.sidebarCollRow} onClick={() => handleSelect(c)}>
+                      <div>{c.title}</div>
+                      <div style={{ fontSize: 11, color: "#6d7175" }}>{c.productsCount?.count ?? 0} products</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {query.length >= 2 && (
               <div style={{ marginTop: 6, border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden" }}>
                 <div style={{ ...sx.sidebarCollRow, borderBottom: "1px solid #e1e3e5" }}
@@ -2733,6 +3090,7 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
 export default function PrepB() {
   const { recentCollections, collection, products, vendorSuggestions, typeSuggestions, tagSuggestions, shop } = useLoaderData();
   const [, setSearchParams] = useSearchParams();
+  const { skuSession, sessionChecked, handleAuthSuccess, handleSignOut } = useSkuSession();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [highlightedProductId, setHighlightedProductId] = useState(null);
   const highlightTimerRef = useRef(null);
@@ -2811,41 +3169,88 @@ export default function PrepB() {
     return `https://admin.shopify.com/store/${storeHandle}/bulk/product?${params.toString()}`;
   })();
 
+  const [renameValue, setRenameValue] = useState("");
+  const renameFetcher = useFetcher();
+  const deleteFetcher = useFetcher();
+
+  function handleRenameConfirm() {
+    renameFetcher.submit({ intent: "rename-collection", collectionId: collection.id, title: renameValue }, { method: "POST" });
+  }
+
+  function handleDeleteConfirm() {
+    deleteFetcher.submit({ intent: "delete-collection", collectionId: collection.id }, { method: "POST" });
+  }
+
+  useEffect(() => {
+    if (renameFetcher.data?.renamedCollection) {
+      setSearchParams({ collectionId: collection.id });
+    }
+  }, [renameFetcher.data]);
+
+  useEffect(() => {
+    if (deleteFetcher.data?.deletedCollectionId) {
+      setSearchParams({});
+    }
+  }, [deleteFetcher.data]);
+
   function handleSelectCollection(c) {
     setSearchParams({ collectionId: c.id });
     setSidebarOpen(false);
   }
 
+  // Hooks above must run unconditionally on every render — this guard comes
+  // after all of them, right before the JSX return.
+  if (!sessionChecked) return null;
+
   return (
-    <s-page heading="Prep B">
-      <CollectionSidebar
-        activeCollection={collection}
-        products={products}
-        onSelect={handleSelectCollection}
-        onDeselect={() => setSearchParams({})}
-        open={sidebarOpen}
-        onToggle={() => setSidebarOpen(v => !v)}
-        onProductsChanged={() => setSearchParams({ collectionId: collection?.id })}
-        onJumpToProduct={jumpToProduct}
-      />
+    <>
+      {!skuSession && <PinOverlay onSuccess={handleAuthSuccess} />}
+      <s-page heading="Prep B">
+        {skuSession && <UserBadge username={skuSession.username} onSignOut={handleSignOut} />}
+        <CollectionSidebar
+          activeCollection={collection}
+          products={products}
+          onSelect={handleSelectCollection}
+          onDeselect={() => setSearchParams({})}
+          open={sidebarOpen}
+          onToggle={() => setSidebarOpen(v => !v)}
+          onProductsChanged={() => setSearchParams({ collectionId: collection?.id })}
+          onJumpToProduct={jumpToProduct}
+          skuSession={skuSession}
+        />
       <div style={{ position: "relative" }}>
-        {collection && (
-          <a
-            href={bulkEditUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              position: "absolute", top: 0, right: 0, zIndex: 1,
-              display: "inline-block", fontSize: 11, fontWeight: 600, color: "#202223",
-              background: "#fff", border: "1px solid #c9cccf", borderRadius: 5,
-              padding: "2px 8px", textDecoration: "none", lineHeight: 1.4,
-            }}
-          >
-            Bulk Edit ↗
-          </a>
-        )}
         {collection ? (
-          <s-section heading={collection.title}>
+          <s-section>
+            <s-stack direction="inline" justifyContent="space-between" alignItems="center" padding="small-300">
+              <s-heading>{collection.title}</s-heading>
+              <s-stack direction="inline" gap="small-300">
+                <s-button href={bulkEditUrl} target="_blank" variant="secondary">Bulk Edit ↗</s-button>
+                <s-button
+                  variant="secondary"
+                  commandFor="rename-collection-modal"
+                  command="--show"
+                  onClick={() => setRenameValue(collection.title)}
+                >
+                  Rename
+                </s-button>
+                <s-button
+                  variant="secondary"
+                  tone="critical"
+                  commandFor="delete-collection-modal"
+                  command="--show"
+                >
+                  Delete
+                </s-button>
+              </s-stack>
+            </s-stack>
+
+            {renameFetcher.data?.renameError && (
+              <div style={{ fontSize: 12, color: "#d82c0d", marginTop: 6, padding: "0 12px" }}>{renameFetcher.data.renameError}</div>
+            )}
+            {deleteFetcher.data?.deleteError && (
+              <div style={{ fontSize: 12, color: "#d82c0d", marginTop: 6, padding: "0 12px" }}>{deleteFetcher.data.deleteError}</div>
+            )}
+
             <div style={{ border: "1px solid #e1e3e5", borderRadius: 8, overflow: "hidden", background: "#fff" }}>
               {/* ── Search / Filter / Sort toolbar ── */}
               {products.length > 0 && (
@@ -2918,6 +3323,29 @@ export default function PrepB() {
                 onAdded={() => setSearchParams({ collectionId: collection.id })}
               />
             </div>
+
+            <s-modal id="rename-collection-modal" heading="Rename collection" accessibilityLabel="Rename collection">
+              <s-text-field label="Collection name" value={renameValue} onInput={e => setRenameValue(e.currentTarget.value)} />
+              <s-button slot="primary-action" variant="primary" commandFor="rename-collection-modal" command="--hide" onClick={handleRenameConfirm}>
+                Save
+              </s-button>
+              <s-button slot="secondary-actions" variant="secondary" commandFor="rename-collection-modal" command="--hide">
+                Cancel
+              </s-button>
+            </s-modal>
+
+            <s-modal id="delete-collection-modal" heading="Delete collection?" accessibilityLabel="Delete collection confirmation">
+              <s-stack gap="base">
+                <s-text>Are you sure you want to delete &quot;{collection.title}&quot;?</s-text>
+                <s-text tone="caution">This deletes the collection itself (not its products). This action cannot be undone.</s-text>
+              </s-stack>
+              <s-button slot="primary-action" variant="primary" tone="critical" commandFor="delete-collection-modal" command="--hide" onClick={handleDeleteConfirm}>
+                Delete collection
+              </s-button>
+              <s-button slot="secondary-actions" variant="secondary" commandFor="delete-collection-modal" command="--hide">
+                Cancel
+              </s-button>
+            </s-modal>
           </s-section>
         ) : (
           <s-section>
@@ -2925,7 +3353,8 @@ export default function PrepB() {
           </s-section>
         )}
       </div>
-    </s-page>
+      </s-page>
+    </>
   );
 }
 
@@ -3081,6 +3510,18 @@ const sx = {
   discardBtn: {
     background: "#fff", color: "#d82c0d", border: "1px solid #d82c0d",
     borderRadius: 6, padding: "10px 20px", fontSize: 14, fontWeight: 600,
+  },
+  aiBtn: {
+    background: "#f0f7ff", color: "#005bd3", border: "1px solid #c2d4f8",
+    borderRadius: 999, padding: "3px 12px", fontSize: 11, fontWeight: 700,
+  },
+  aiGhostBtn: {
+    background: "none", color: "#6d7175", border: "1px solid #c9cccf",
+    borderRadius: 999, padding: "3px 10px", fontSize: 11, fontWeight: 600, cursor: "pointer",
+  },
+  aiPromptInput: {
+    border: "1px solid #c9cccf", borderRadius: 6, padding: "4px 8px",
+    fontSize: 11, outline: "none", background: "#fff", color: "#202223", width: 200,
   },
   // Bubble editors
   bubbleBox: {

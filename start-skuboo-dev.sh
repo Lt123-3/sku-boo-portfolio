@@ -15,5 +15,25 @@ else
   echo "dev.skuboo.com tunnel already running."
 fi
 
+# NOTE: real secret values redacted for the `review` branch — placeholders only.
+# See .env.example for what each variable is.
+export SHOP_DOMAIN=your-dev-store.myshopify.com
+# Was never actually set here before now — dev-mode testing of the ext-api.*
+# routes needs this too, not just the read_orders/read_customers scopes.
+export EXTENSION_API_TOKEN=YOUR_DEV_EXTENSION_API_TOKEN
+export ESP_API_TOKEN=YOUR_DEV_ESP_API_TOKEN
+export SHIPPO_API_KEY=shippo_test_YOUR_SHIPPO_TEST_KEY
+export SHIP_FROM_NAME="Shipping Desk"
+export SHIP_FROM_STREET1="123 Example St"
+export SHIP_FROM_CITY="Anytown"
+export SHIP_FROM_STATE=CA
+export SHIP_FROM_ZIP=00000
+
+# ESP32 shipping-desk relay — same as production's copy in start-skuboo.sh,
+# just pointed at the dev store via SHOP_DOMAIN above.
+node esp-server.js &
+ESP_PID=$!
+trap "kill $ESP_PID 2>/dev/null" EXIT
+
 echo "Starting Shopify dev server pointed at https://dev.skuboo.com:3000 ..."
 npm run dev -- --tunnel-url https://dev.skuboo.com:3000

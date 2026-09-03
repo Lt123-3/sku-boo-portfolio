@@ -141,16 +141,19 @@ export async function action({ request }) {
   if (intent === "add_user") {
     const userId   = formData.get("userId")?.toString().trim();
     const username = formData.get("username")?.toString().trim();
+    const initials = formData.get("initials")?.toString().trim().toLowerCase();
     const role     = formData.get("role")?.toString().trim();
 
     if (!userId || !/^\d{4}$/.test(userId))
       return Response.json({ success: false, error: "Access code must be exactly 4 digits" });
     if (!username)
       return Response.json({ success: false, error: "Username is required" });
+    if (!initials || !/^[a-z]{1,4}$/.test(initials))
+      return Response.json({ success: false, error: "Initials must be 1-4 letters" });
 
     try {
       await prisma.accessKey.create({
-        data: { shopId, userId, username, role: role ?? "operator", active: true },
+        data: { shopId, userId, username, initials, role: role ?? "operator", active: true },
       });
       return Response.json({ success: true, message: "User added successfully" });
     } catch {
@@ -166,6 +169,19 @@ export async function action({ request }) {
       return Response.json({ success: true });
     } catch {
       return Response.json({ success: false, error: "Failed to update user" });
+    }
+  }
+
+  if (intent === "update_initials") {
+    const keyId    = parseInt(formData.get("keyId"));
+    const initials = formData.get("initials")?.toString().trim().toLowerCase();
+    if (!initials || !/^[a-z]{1,4}$/.test(initials))
+      return Response.json({ success: false, error: "Initials must be 1-4 letters" });
+    try {
+      await prisma.accessKey.update({ where: { id: keyId }, data: { initials } });
+      return Response.json({ success: true });
+    } catch {
+      return Response.json({ success: false, error: "Failed to update initials" });
     }
   }
 
@@ -234,22 +250,11 @@ export default function AdminPage() {
 
   const { stats, accessKeys, syncState: initialSyncState, recentChanges } = loaderData ?? {};
 
-  // --- Session expired guard ---
-  if (!stats || !accessKeys) {
-    return (
-      <s-page heading="SKU Boo — Admin Panel">
-        <s-section>
-          <div style={{ fontSize: "16px", color: "#6d7175", padding: "32px", textAlign: "center" }}>
-            Session expired. Please sign in again from the main page.
-          </div>
-        </s-section>
-      </s-page>
-    );
-  }
-
+  // Hooks must run unconditionally on every render — the "session expired"
+  // early return lives below, after every hook has been declared.
   const [syncState,    setSyncState]    = useState(initialSyncState);
   const [liveStats,    setLiveStats]    = useState(stats ?? {});
-  const [newUser,      setNewUser]      = useState({ userId: "", username: "", role: "operator" });
+  const [newUser,      setNewUser]      = useState({ userId: "", username: "", initials: "", role: "operator" });
   const [userMessage,  setUserMessage]  = useState(null);
   const [syncMessage,  setSyncMessage]  = useState(null);
   const [speed,        setSpeed]        = useState("medium");
@@ -305,6 +310,19 @@ export default function AdminPage() {
     }
   }, [fetcher.data]);
 
+  // --- Session expired guard ---
+  if (!stats || !accessKeys) {
+    return (
+      <s-page heading="SKU Boo — Admin Panel">
+        <s-section>
+          <div style={{ fontSize: "16px", color: "#6d7175", padding: "32px", textAlign: "center" }}>
+            Session expired. Please sign in again from the main page.
+          </div>
+        </s-section>
+      </s-page>
+    );
+  }
+
   function handleForceCron() {
     setSyncMessage("Forcing cron run...");
     fetcher.submit({ intent: "force_cron", sessionId }, { method: "POST", action: "/app/admin" });
@@ -352,6 +370,13 @@ export default function AdminPage() {
     fetcher.submit({ intent: "add_user", ...newUser, sessionId }, { method: "POST", action: "/app/admin" });
   }
 
+  function handleUpdateInitials(keyId, initials) {
+    fetcher.submit(
+      { intent: "update_initials", keyId: String(keyId), initials, sessionId },
+      { method: "POST", action: "/app/admin" }
+    );
+  }
+
   return (
     <s-page heading="SKU Boo — Admin Panel">
 
@@ -363,6 +388,18 @@ export default function AdminPage() {
             onClick={() => navigate(`/app/problem-dashboard?sessionId=${sessionId}`)}
           >
             ⚠ Problem Dashboard
+          </s-button>
+          <s-button
+            variant="secondary"
+            onClick={() => navigate(`/app/packages?sessionId=${sessionId}`)}
+          >
+            📦 Saved Packages
+          </s-button>
+          <s-button
+            variant="secondary"
+            onClick={() => navigate(`/app/ai-settings?sessionId=${sessionId}`)}
+          >
+            🤖 AI Settings
           </s-button>
         </div>
       </s-section>
@@ -560,6 +597,16 @@ export default function AdminPage() {
               />
             </div>
             <div>
+              <div style={labelStyle}>Initials <span style={{ color: "#6d7175", fontWeight: "400" }}>(names auto-created collections)</span></div>
+              <input
+                style={{ ...inputStyle, width: "90px", letterSpacing: "2px", fontFamily: "monospace" }}
+                placeholder="lt"
+                maxLength={4}
+                value={newUser.initials}
+                onChange={(e) => setNewUser((u) => ({ ...u, initials: e.target.value.replace(/[^a-zA-Z]/g, "").toLowerCase() }))}
+              />
+            </div>
+            <div>
               <div style={labelStyle}>Role</div>
               <select
                 style={{ ...inputStyle, width: "140px" }}
@@ -584,7 +631,7 @@ export default function AdminPage() {
         <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: "0", fontSize: "14px" }}>
           <thead>
             <tr style={{ background: "#f6f6f7" }}>
-              {["Username", "Code", "Role", "Status", "Added", "Action"].map((h) => (
+              {["Username", "Code", "Initials", "Role", "Status", "Added", "Action"].map((h) => (
                 <th key={h} style={{ padding: "12px 16px", fontWeight: "700", color: "#202223", fontSize: "13px", textAlign: "left", borderBottom: "2px solid #e1e3e5" }}>
                   {h}
                 </th>
@@ -596,6 +643,20 @@ export default function AdminPage() {
               <tr key={key.id} style={{ background: i % 2 === 0 ? "#ffffff" : "#fafafa" }}>
                 <td style={{ ...td, fontWeight: "600", fontSize: "15px" }}>{key.username}</td>
                 <td style={{ ...td, fontFamily: "monospace", fontSize: "15px", letterSpacing: "2px" }}>{key.userId}</td>
+                <td style={td}>
+                  <input
+                    key={key.id}
+                    defaultValue={key.initials ?? ""}
+                    maxLength={4}
+                    placeholder="—"
+                    style={{ ...inputStyle, width: "60px", fontFamily: "monospace", letterSpacing: "1px" }}
+                    onBlur={(e) => {
+                      const next = e.target.value.replace(/[^a-zA-Z]/g, "").toLowerCase();
+                      e.target.value = next;
+                      if (next && next !== (key.initials ?? "")) handleUpdateInitials(key.id, next);
+                    }}
+                  />
+                </td>
                 <td style={td}>
                   <span style={{
                     background:    key.role === "admin" ? "#fff0f0" : key.role === "operator" ? "#f0f7ff" : "#f6f6f7",
