@@ -1,0 +1,21 @@
+client_id = "YOUR_SHOPIFY_CLIENT_ID"
+name = "SKU Boo"
+application_url = "https://skuboo.com/app"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = false
+
+[webhooks]
+api_version = "2026-07"
+
+[access_scopes]
+scopes = "write_products,read_products,read_locations,read_inventory,write_files"
+
+[auth]
+redirect_urls = [
+  "https://skuboo.com/auth/callback",
+  "https://skuboo.com/auth/shopify/callback",
+  "https://skuboo.com/api/auth/callback",
+  "https://skuboo.com/api/auth"
+]

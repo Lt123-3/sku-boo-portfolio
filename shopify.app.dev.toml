@@ -1,0 +1,27 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "YOUR_SHOPIFY_DEV_CLIENT_ID"
+name = "SKU Boo Dev"
+application_url = "https://dev.skuboo.com/app"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+dev_store_url = "your-dev-store.myshopify.com"
+
+[webhooks]
+api_version = "2025-07"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_inventory,read_locations,read_products,write_products,write_inventory,write_files"
+optional_scopes = [ ]
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = [
+  "https://dev.skuboo.com/auth/callback",
+  "https://dev.skuboo.com/auth/shopify/callback",
+  "https://dev.skuboo.com/api/auth/callback",
+  "https://dev.skuboo.com/api/auth"
+]
