@@ -1,6 +1,6 @@
 // app/lib/validate.server.js
 
-import { SKU_STATUS, ACCESS_ROLES, SKU_PROBLEMS } from "../config.js"
+import { SKU_STATUS, ACCESS_ROLES, SKU_PROBLEMS } from "../Config.js"
 
 export function validateSkuStatus(value) {
   const valid = Object.values(SKU_STATUS)

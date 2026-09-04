@@ -5,6 +5,37 @@ import { validateAccessKey, createSkuSession } from "../lib/access.server.js";
 
 // --- No loader needed — this route is action-only ---
 
+// --- Simple in-memory PIN lockout ---
+// Tracks failed attempts per shop+userId. Not persisted across server
+// restarts — fine for throttling a 4-digit PIN on a small internal tool.
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS    = 5 * 60 * 1000; // 5 minutes
+const failedAttempts = new Map(); // key -> { count, lockedUntil }
+
+function attemptKey(shopId, userId) {
+  return `${shopId}:${userId}`;
+}
+
+function getLockout(key) {
+  const record = failedAttempts.get(key);
+  if (!record) return null;
+  if (record.lockedUntil && record.lockedUntil <= Date.now()) {
+    failedAttempts.delete(key);
+    return null;
+  }
+  return record;
+}
+
+function recordFailure(key) {
+  const record = failedAttempts.get(key) ?? { count: 0, lockedUntil: null };
+  record.count += 1;
+  if (record.count >= MAX_ATTEMPTS) {
+    record.lockedUntil = Date.now() + LOCKOUT_MS;
+    record.count = 0;
+  }
+  failedAttempts.set(key, record);
+}
+
 // --- Action ---
 // Validates PIN and creates a session
 // Returns { success, sessionId, username, role } or { success: false, error }
@@ -23,14 +54,30 @@ export async function action({ request }) {
     );
   }
 
+  const key = attemptKey(shopId, userId);
+
+  // --- Locked out from too many recent failures ---
+  const lockout = getLockout(key);
+  if (lockout?.lockedUntil) {
+    const secondsLeft = Math.ceil((lockout.lockedUntil - Date.now()) / 1000);
+    return new Response(
+      JSON.stringify({ success: false, error: `Too many failed attempts. Try again in ${secondsLeft}s.` }),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   // --- Validate access key ---
   const accessKey = await validateAccessKey({ userId, shopId });
   if (!accessKey) {
+    recordFailure(key);
     return new Response(
       JSON.stringify({ success: false, error: "Invalid or revoked access key" }),
       { headers: { "Content-Type": "application/json" } }
     );
   }
+
+  // --- Success — clear any failure history for this key ---
+  failedAttempts.delete(key);
 
   // --- Create session in SQLite ---
   const skuSession = await createSkuSession({ userId, shopId });

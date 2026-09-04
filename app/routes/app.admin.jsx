@@ -4,6 +4,7 @@ import { authenticate }                          from "../shopify.server.js";
 import { useFetcher, useLoaderData, useNavigate } from "react-router";
 import { useState, useEffect }                   from "react";
 import { validateSkuSession }                    from "../lib/access.server.js";
+import { validateRole }                          from "../lib/validate.server.js";
 import prisma                                    from "../db.server.js";
 
 // ── Loader ────────────────────────────────────────────────────────────────────
@@ -142,7 +143,6 @@ export async function action({ request }) {
     const userId   = formData.get("userId")?.toString().trim();
     const username = formData.get("username")?.toString().trim();
     const initials = formData.get("initials")?.toString().trim().toLowerCase();
-    const role     = formData.get("role")?.toString().trim();
 
     if (!userId || !/^\d{4}$/.test(userId))
       return Response.json({ success: false, error: "Access code must be exactly 4 digits" });
@@ -151,9 +151,16 @@ export async function action({ request }) {
     if (!initials || !/^[a-z]{1,4}$/.test(initials))
       return Response.json({ success: false, error: "Initials must be 1-4 letters" });
 
+    let role;
+    try {
+      role = validateRole(formData.get("role")?.toString().trim() || "operator");
+    } catch (err) {
+      return Response.json({ success: false, error: err.message });
+    }
+
     try {
       await prisma.accessKey.create({
-        data: { shopId, userId, username, initials, role: role ?? "operator", active: true },
+        data: { shopId, userId, username, initials, role, active: true },
       });
       return Response.json({ success: true, message: "User added successfully" });
     } catch {
