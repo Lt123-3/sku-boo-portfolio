@@ -7,7 +7,6 @@ export SCOPES=write_products,read_products,read_locations,read_inventory,write_f
 export SHOPIFY_APP_URL=https://skuboo.com
 export SHOP_DOMAIN=your-store.myshopify.com
 export SESSION_SECRET=YOUR_SESSION_SECRET
-export EXTENSION_API_TOKEN=YOUR_EXTENSION_API_TOKEN
 export ESP_API_TOKEN=YOUR_ESP_API_TOKEN
 # Test key — no real charges, swap for a shippo_live_... key when ready.
 export SHIPPO_API_KEY=shippo_test_YOUR_SHIPPO_TEST_KEY

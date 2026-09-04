@@ -256,27 +256,3 @@ model AiUsageLog {
   @@index([shopId, createdAt])
   @@index([callType])
 }
-
-// ── In-flight ESP submission: written by the WebSocket relay when the ESP
-// submits an order+package+weight, read by the extension (ext-api.pending-
-// submission), filled in by the extension (ext-api.report-rate) once a rate
-// is computed, and polled by the relay so it can push the result back down
-// the still-open WebSocket connection. This table *is* the shared truth
-// between the two processes — no direct process-to-process link needed.
-model PendingSubmission {
-  id          Int       @id @default(autoincrement())
-  shopId      String
-  orderId     String // Order GID
-  orderName   String
-  packageName String
-  weightLb    Float
-  address     String // JSON-serialized shipping address
-  lineItems   String // JSON-serialized line items
-  rate        Float? // null until the extension reports back
-  ratedAt     DateTime?
-  deliveredAt DateTime? // set once the relay pushes it to the ESP
-  createdAt   DateTime  @default(now())
-
-  @@index([shopId])
-  @@index([orderId])
-}

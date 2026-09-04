@@ -18,9 +18,6 @@ fi
 # NOTE: real secret values redacted for the `review` branch — placeholders only.
 # See .env.example for what each variable is.
 export SHOP_DOMAIN=your-dev-store.myshopify.com
-# Was never actually set here before now — dev-mode testing of the ext-api.*
-# routes needs this too, not just the read_orders/read_customers scopes.
-export EXTENSION_API_TOKEN=YOUR_DEV_EXTENSION_API_TOKEN
 export ESP_API_TOKEN=YOUR_DEV_ESP_API_TOKEN
 export SHIPPO_API_KEY=shippo_test_YOUR_SHIPPO_TEST_KEY
 export SHIP_FROM_NAME="Shipping Desk"
