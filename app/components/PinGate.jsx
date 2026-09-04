@@ -39,16 +39,41 @@ export function useSkuSession() {
   return { skuSession, sessionChecked, handleAuthSuccess, handleSignOut };
 }
 
+const PIN_LOCKOUT_STORAGE_KEY = "skuboo_pin_locked_until";
+
 // --- Full-screen PIN entry overlay — shown until a valid PIN is entered ---
 export function PinOverlay({ onSuccess }) {
   const fetcher = useFetcher();
-  const [code, setCode]   = useState("");
+  const [code, setCode]               = useState("");
+  const [lockedUntil, setLockedUntil] = useState(() => {
+    if (typeof window === "undefined") return null;
+    const stored = Number(sessionStorage.getItem(PIN_LOCKOUT_STORAGE_KEY) || 0);
+    return stored > Date.now() ? stored : null;
+  });
+  const [now, setNow]     = useState(Date.now());
   const isLoading         = fetcher.state !== "idle";
+  const isLocked          = !!lockedUntil && lockedUntil > now;
+  const secondsLeft       = isLocked ? Math.max(0, Math.ceil((lockedUntil - now) / 1000)) : 0;
   const error             = fetcher.data?.error;
+
+  // --- Tick the countdown once a second while locked ---
+  useEffect(() => {
+    if (!isLocked) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [isLocked]);
+
+  // --- Clear the lock once the cooldown elapses ---
+  useEffect(() => {
+    if (lockedUntil && lockedUntil <= now) {
+      setLockedUntil(null);
+      sessionStorage.removeItem(PIN_LOCKOUT_STORAGE_KEY);
+    }
+  }, [now, lockedUntil]);
 
   // --- Auto-submit on 4 digits ---
   useEffect(() => {
-    if (code.length === 4) {
+    if (code.length === 4 && !isLocked) {
       fetcher.submit(
         { userId: code },
         { method: "POST", action: "/app/login" }
@@ -69,10 +94,16 @@ export function PinOverlay({ onSuccess }) {
       });
     } else if (fetcher.data?.success === false) {
       setCode("");
+      if (fetcher.data.lockedUntil) {
+        setNow(Date.now());
+        setLockedUntil(fetcher.data.lockedUntil);
+        sessionStorage.setItem(PIN_LOCKOUT_STORAGE_KEY, String(fetcher.data.lockedUntil));
+      }
     }
   }, [fetcher.data]);
 
   function handleInput(e) {
+    if (isLocked) return;
     const val = e.target.value.replace(/\D/g, "");
     if (val.length <= 4) setCode(val);
   }
@@ -95,26 +126,33 @@ export function PinOverlay({ onSuccess }) {
             onChange={handleInput}
             placeholder="····"
             autoFocus
-            disabled={isLoading}
+            disabled={isLoading || isLocked}
             style={{
               ...overlayStyles.input,
-              borderColor: error
+              borderColor: isLocked || error
                 ? "#d82c0d"
                 : code.length === 4
                 ? "#008060"
                 : "#e1e3e5",
+              opacity: isLocked ? 0.6 : 1,
+              cursor: isLocked ? "not-allowed" : "text",
             }}
           />
         </div>
 
         {/* --- Status messages only — dots removed --- */}
-        {isLoading && (
+        {isLocked && (
+          <div style={{ ...overlayStyles.status, color: "#d82c0d", fontWeight: "600" }}>
+            Too many failed attempts. Try again in {secondsLeft}s.
+          </div>
+        )}
+        {!isLocked && isLoading && (
           <div style={overlayStyles.status}>Checking...</div>
         )}
-        {error && !isLoading && (
+        {!isLocked && error && !isLoading && (
           <div style={{ ...overlayStyles.status, color: "#d82c0d" }}>{error}</div>
         )}
-        {!error && !isLoading && code.length === 0 && (
+        {!isLocked && !error && !isLoading && code.length === 0 && (
           <div style={overlayStyles.status}>Enter your 4 digit access key</div>
         )}
 

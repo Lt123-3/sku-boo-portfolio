@@ -36,6 +36,20 @@ function recordFailure(key) {
   failedAttempts.set(key, record);
 }
 
+// lockedUntil is sent to the client so it can disable the PIN input for the
+// remaining cooldown instead of just showing an error and letting them retry.
+function lockedResponse(lockedUntil) {
+  const secondsLeft = Math.max(1, Math.ceil((lockedUntil - Date.now()) / 1000));
+  return new Response(
+    JSON.stringify({
+      success:     false,
+      error:       `Too many failed attempts. Try again in ${secondsLeft}s.`,
+      lockedUntil,
+    }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+}
+
 // --- Action ---
 // Validates PIN and creates a session
 // Returns { success, sessionId, username, role } or { success: false, error }
@@ -59,17 +73,17 @@ export async function action({ request }) {
   // --- Locked out from too many recent failures ---
   const lockout = getLockout(key);
   if (lockout?.lockedUntil) {
-    const secondsLeft = Math.ceil((lockout.lockedUntil - Date.now()) / 1000);
-    return new Response(
-      JSON.stringify({ success: false, error: `Too many failed attempts. Try again in ${secondsLeft}s.` }),
-      { headers: { "Content-Type": "application/json" } }
-    );
+    return lockedResponse(lockout.lockedUntil);
   }
 
   // --- Validate access key ---
   const accessKey = await validateAccessKey({ userId, shopId });
   if (!accessKey) {
     recordFailure(key);
+    const afterFailure = getLockout(key);
+    if (afterFailure?.lockedUntil) {
+      return lockedResponse(afterFailure.lockedUntil);
+    }
     return new Response(
       JSON.stringify({ success: false, error: "Invalid or revoked access key" }),
       { headers: { "Content-Type": "application/json" } }
