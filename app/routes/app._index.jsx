@@ -6,7 +6,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import prisma from "../db.server";
 import { useFetcher, useLoaderData, useNavigate } from "react-router";
 import { useState, useEffect } from "react";
-import { validateSkuSession, cleanExpiredSessions } from "../lib/access.server.js";
+import { validateSkuSession, cleanExpiredSessions, isMutationAllowed } from "../lib/access.server.js";
 import { runDripSync, startBackgroundCron } from "../lib/sync.server.js";
 import { PinOverlay, UserBadge, useSkuSession } from "../components/PinGate.jsx";
 
@@ -113,6 +113,9 @@ export const action = async ({ request }) => {
       JSON.stringify({ needsAuth: true }),
       { headers: { "Content-Type": "application/json" } }
     );
+  }
+  if (!isMutationAllowed(skuSession)) {
+    return new Response("Forbidden", { status: 403 });
   }
 
   // --- Handle delete ---
@@ -396,6 +399,7 @@ export default function Index() {
   const navigate = useNavigate();
 
   const { skuSession, sessionChecked, handleAuthSuccess, handleSignOut } = useSkuSession();
+  const isViewer = skuSession?.role === "viewer";
 
   // --- Navigate to admin page with session ---
   function handleAdminNav() {
@@ -487,12 +491,14 @@ export default function Index() {
           <s-stack direction="inline" gap="base">
             <s-button
               onClick={generateSku}
+              disabled={isViewer}
+              title={isViewer ? "Viewers can't generate SKUs" : undefined}
               {...(isLoading ? { loading: true } : {})}
             >
               Generate Next SKU
             </s-button>
 
-            {fetcher.data?.productId && (
+            {!isViewer && fetcher.data?.productId && (
               <s-button
                 onClick={() => openProductEditor(fetcher.data.productId)}
                 variant="primary"
@@ -588,36 +594,40 @@ export default function Index() {
                         </s-table-cell>
 
                         <s-table-cell>
-                          <s-stack direction="inline" gap="small">
-                            <s-button
-                              variant="tertiary"
-                              onClick={() => openProductEditor(entry.productId)}
-                            >
-                              Edit
-                            </s-button>
-                            <s-button
-                              variant="tertiary"
-                              tone="critical"
-                              onClick={() => {
-                                const confirmed = window.confirm(
-                                  `Delete SKU ${entry.sku}?\n\nThis will permanently remove the product from Shopify and the log. This cannot be undone.`
-                                );
-                                if (confirmed) {
-                                  fetcher.submit(
-                                    {
-                                      intent:    "delete",
-                                      productId: entry.productId,
-                                      skuLogId:  String(entry.id),
-                                      sessionId: skuSession?.sessionId ?? "",
-                                    },
-                                    { method: "POST" }
+                          {isViewer ? (
+                            <s-text tone="subdued">View only</s-text>
+                          ) : (
+                            <s-stack direction="inline" gap="small">
+                              <s-button
+                                variant="tertiary"
+                                onClick={() => openProductEditor(entry.productId)}
+                              >
+                                Edit
+                              </s-button>
+                              <s-button
+                                variant="tertiary"
+                                tone="critical"
+                                onClick={() => {
+                                  const confirmed = window.confirm(
+                                    `Delete SKU ${entry.sku}?\n\nThis will permanently remove the product from Shopify and the log. This cannot be undone.`
                                   );
-                                }
-                              }}
-                            >
-                              Delete
-                            </s-button>
-                          </s-stack>
+                                  if (confirmed) {
+                                    fetcher.submit(
+                                      {
+                                        intent:    "delete",
+                                        productId: entry.productId,
+                                        skuLogId:  String(entry.id),
+                                        sessionId: skuSession?.sessionId ?? "",
+                                      },
+                                      { method: "POST" }
+                                    );
+                                  }
+                                }}
+                              >
+                                Delete
+                              </s-button>
+                            </s-stack>
+                          )}
                         </s-table-cell>
                       </s-table-row>
                     );

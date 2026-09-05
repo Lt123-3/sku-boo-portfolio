@@ -8,7 +8,7 @@ import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { generateProductText } from "../lib/ai.server.js";
 import { PinOverlay, UserBadge, useSkuSession } from "../components/PinGate.jsx";
-import { validateSkuSession } from "../lib/access.server.js";
+import { validateSkuSession, isMutationAllowed } from "../lib/access.server.js";
 import prisma from "../db.server.js";
 
 const RECENT_COUNT   = 20;
@@ -245,7 +245,22 @@ export const action = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const shopId     = session.shop;
   const form       = await request.formData();
-  const intent     = form.get("intent");
+
+  const sessionId  = form.get("sessionId")?.toString();
+  const skuSession = await validateSkuSession({ sessionId, shopId });
+  if (!skuSession) return new Response("Unauthorized", { status: 401 });
+
+  const intent = form.get("intent");
+
+  // Read-only lookups stay available to viewers — only intents that actually
+  // write data or spend AI tokens require operator/admin.
+  const READ_ONLY_INTENTS = new Set([
+    "search", "search-category", "browse-categories", "browse-children",
+    "suggest-more", "search-products", "suggest-my-collections",
+  ]);
+  if (!READ_ONLY_INTENTS.has(intent) && !isMutationAllowed(skuSession)) {
+    return new Response("Forbidden", { status: 403 });
+  }
 
   // ── AI-generate title / description ───────────────────────────────────────
   if (intent === "generate-title" || intent === "generate-description") {
@@ -981,7 +996,7 @@ function TagEditor({ tags, onChange, suggestions = [], hasNextPage = false, load
 // ── usePaginatedSuggestions — cursor-paginated, store-wide suggestion list ────
 // Shared at the Prep page level (like allSkus) rather than per-row: vendor/type/
 // tag values aren't per-product, so every row should see the same loaded pages.
-function usePaginatedSuggestions(field, initialPage) {
+function usePaginatedSuggestions(field, initialPage, sessionId) {
   const fetcher = useFetcher();
   const [state, setState] = useState({
     nodes: initialPage.nodes,
@@ -1001,7 +1016,7 @@ function usePaginatedSuggestions(field, initialPage) {
 
   function loadMore() {
     if (!state.hasNextPage || fetcher.state !== "idle") return;
-    fetcher.submit({ intent: "suggest-more", field, after: state.endCursor ?? "" }, { method: "POST" });
+    fetcher.submit({ intent: "suggest-more", field, after: state.endCursor ?? "", sessionId: sessionId ?? "" }, { method: "POST" });
   }
 
   // Auto-walk every page in the background (typing should be able to search
@@ -1214,7 +1229,7 @@ function RichTextEditor({ content, onChange }) {
 }
 
 // ── CategoryEditor — tree browser + search ────────────────────────────────────
-function CategoryEditor({ category, onChange }) {
+function CategoryEditor({ category, onChange, skuSession }) {
   const browseF  = useFetcher();
   const searchF  = useFetcher();
   const panelRef = useRef(null);
@@ -1228,9 +1243,9 @@ function CategoryEditor({ category, onChange }) {
     if (!open) return;
     if (category.id) {
       setQuery(category.name);
-      searchF.submit({ intent: "search-category", query: category.name }, { method: "POST" });
+      searchF.submit({ intent: "search-category", query: category.name, sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
     } else if (stack.length === 0 && browseF.state === "idle" && !browseF.data) {
-      browseF.submit({ intent: "browse-categories" }, { method: "POST" });
+      browseF.submit({ intent: "browse-categories", sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
     }
   }, [open]);
 
@@ -1249,7 +1264,7 @@ function CategoryEditor({ category, onChange }) {
   }, [open]);
 
   const debouncedCategorySearch = useDebounce(val => {
-    if (val.trim().length >= 2) searchF.submit({ intent: "search-category", query: val }, { method: "POST" });
+    if (val.trim().length >= 2) searchF.submit({ intent: "search-category", query: val, sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
   });
 
   function handleQuery(e) {
@@ -1261,16 +1276,16 @@ function CategoryEditor({ category, onChange }) {
   function drillIn(cat) {
     const newStack = [...stack, { id: cat.id, name: cat.name }];
     setStack(newStack);
-    browseF.submit({ intent: "browse-children", parentId: cat.id }, { method: "POST" });
+    browseF.submit({ intent: "browse-children", parentId: cat.id, sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
   }
 
   function drillOut() {
     const newStack = stack.slice(0, -1);
     setStack(newStack);
     if (newStack.length === 0) {
-      browseF.submit({ intent: "browse-categories" }, { method: "POST" });
+      browseF.submit({ intent: "browse-categories", sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
     } else {
-      browseF.submit({ intent: "browse-children", parentId: newStack[newStack.length - 1].id }, { method: "POST" });
+      browseF.submit({ intent: "browse-children", parentId: newStack[newStack.length - 1].id, sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
     }
   }
 
@@ -1379,7 +1394,7 @@ function CategoryEditor({ category, onChange }) {
 }
 
 // ── ImageManager — drag-to-reorder, file upload, X top-right ──────────────────
-function ImageManager({ images, onUpdate }) {
+function ImageManager({ images, onUpdate, skuSession }) {
   const uploadFetcher     = useFetcher();
   const fileInputRef      = useRef(null);
   const pendingPreviewRef = useRef(null);
@@ -1422,6 +1437,7 @@ function ImageManager({ images, onUpdate }) {
     fd.append("filename", file.name);
     fd.append("mimeType", file.type);
     fd.append("fileSize", String(file.size));
+    fd.append("sessionId", skuSession?.sessionId ?? "");
     uploadFetcher.submit(fd, { method: "POST", encType: "multipart/form-data" });
     e.target.value = "";
   }
@@ -1775,7 +1791,7 @@ function ProductRow({
   vendorSuggestions, vendorSuggestionsHasMore, vendorSuggestionsLoading, onLoadMoreVendors,
   typeSuggestions, typeSuggestionsHasMore, typeSuggestionsLoading, onLoadMoreTypes,
   tagSuggestions, tagSuggestionsHasMore, tagSuggestionsLoading, onLoadMoreTags,
-  collectionId, onRemoved, highlighted,
+  collectionId, onRemoved, highlighted, skuSession,
 }) {
   const REMOVE_DELAY_MS = 3500;
   const fetcher       = useFetcher();
@@ -1831,7 +1847,7 @@ function ProductRow({
     removeTimerRef.current = setTimeout(() => {
       clearInterval(removeIntervalRef.current);
       removeFetcher.submit(
-        { intent: "remove-from-collection", collectionId, productId: product.id },
+        { intent: "remove-from-collection", collectionId, productId: product.id, sessionId: skuSession?.sessionId ?? "" },
         { method: "POST" }
       );
     }, REMOVE_DELAY_MS);
@@ -1970,6 +1986,7 @@ function ProductRow({
         categoryName:    category.name,
         additionalPrompt: aiExtra[kind],
         comparableResearch: comparableResearch ?? "",
+        sessionId: skuSession?.sessionId ?? "",
       },
       { method: "POST" }
     );
@@ -2025,6 +2042,7 @@ function ProductRow({
         variantsJson:             JSON.stringify(
           Object.entries(variantEdits).map(([id, edit]) => ({ id, ...edit }))
         ),
+        sessionId:                skuSession?.sessionId ?? "",
       },
       { method: "POST" }
     );
@@ -2167,7 +2185,7 @@ function ProductRow({
                 </button>
               </div>
             </div>
-            <ImageManager images={images} onUpdate={setImages} />
+            <ImageManager images={images} onUpdate={setImages} skuSession={skuSession} />
           </div>
 
           {/* ── Open in new tab ── */}
@@ -2219,7 +2237,7 @@ function ProductRow({
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div style={sx.relatedFieldsBox}>
                 <Field label="Category">
-                  <CategoryEditor category={category} onChange={setCategory} />
+                  <CategoryEditor category={category} onChange={setCategory} skuSession={skuSession} />
                 </Field>
                 <Field label="Vendor">
                   <SuggestField
@@ -2667,7 +2685,7 @@ function CollectionSelector({ recentCollections, activeCollectionId, onSelect })
 }
 
 // ── AddProductsRow — compact expandable row at top of product list ────────────
-function AddProductsRow({ collectionId, onAdded }) {
+function AddProductsRow({ collectionId, onAdded, skuSession }) {
   const searchFetcher = useFetcher();
   const addFetcher    = useFetcher();
   const [expanded, setExpanded] = useState(false);
@@ -2675,7 +2693,7 @@ function AddProductsRow({ collectionId, onAdded }) {
   const [selected, setSelected] = useState(new Set());
 
   const debouncedSearch = useDebounce(val => {
-    if (val.trim().length >= 2) searchFetcher.submit({ intent: "search-products", query: val }, { method: "POST" });
+    if (val.trim().length >= 2) searchFetcher.submit({ intent: "search-products", query: val, sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
   });
 
   useEffect(() => {
@@ -2697,7 +2715,7 @@ function AddProductsRow({ collectionId, onAdded }) {
 
   function handleAdd() {
     addFetcher.submit(
-      { intent: "add-products", collectionId, productIdsJson: JSON.stringify([...selected]) },
+      { intent: "add-products", collectionId, productIdsJson: JSON.stringify([...selected]), sessionId: skuSession?.sessionId ?? "" },
       { method: "POST" }
     );
   }
@@ -2762,6 +2780,7 @@ function AddProductsRow({ collectionId, onAdded }) {
 
 // ── CollectionSidebar — floating left panel ───────────────────────────────────
 function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, open, onToggle, onProductsChanged, onJumpToProduct, skuSession }) {
+  const isViewer = skuSession?.role === "viewer";
   const searchFetcher  = useFetcher();
   const createFetcher  = useFetcher();
   const prodSearchF    = useFetcher();
@@ -2779,10 +2798,10 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
   const addFetcher = useFetcher();
 
   const debouncedCollSearch = useDebounce(val => {
-    if (val.trim().length >= 2) searchFetcher.submit({ intent: "search", query: val }, { method: "POST" });
+    if (val.trim().length >= 2) searchFetcher.submit({ intent: "search", query: val, sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
   });
   const debouncedProdSearch = useDebounce(val => {
-    if (val.trim().length >= 2) prodSearchF.submit({ intent: "search-products", query: val }, { method: "POST" });
+    if (val.trim().length >= 2) prodSearchF.submit({ intent: "search-products", query: val, sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
   });
 
   useEffect(() => {
@@ -2824,14 +2843,14 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
   function handleProdSearch(e)  { const v = e.target.value; setProdQuery(v); debouncedProdSearch(v); }
   function handleSelect(c)      { onSelect(c); setQuery(""); }
   function handleDeselect()     { setQuery(""); onDeselect(); }
-  function quickCreate(name)    { createFetcher.submit({ intent: "create-collection", title: name.trim() }, { method: "POST" }); }
+  function quickCreate(name)    { createFetcher.submit({ intent: "create-collection", title: name.trim(), sessionId: skuSession?.sessionId ?? "" }, { method: "POST" }); }
 
   function todaySinglesTitle() {
     return `(Singles)${formatMMDDYY(new Date())}`;
   }
 
   function handleSingleProduct() {
-    singlesFetcher.submit({ intent: "find-or-create-singles", title: todaySinglesTitle() }, { method: "POST" });
+    singlesFetcher.submit({ intent: "find-or-create-singles", title: todaySinglesTitle(), sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
   }
 
   function handleNewCollection() {
@@ -2845,7 +2864,7 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
     setPendingIds(prev => new Set([...prev, productId]));
     pendingTimers.current[productId] = setTimeout(() => {
       removeFetcher.submit(
-        { intent: "remove-from-collection", collectionId: activeCollection.id, productId },
+        { intent: "remove-from-collection", collectionId: activeCollection.id, productId, sessionId: skuSession?.sessionId ?? "" },
         { method: "POST" }
       );
       delete pendingTimers.current[productId];
@@ -2860,7 +2879,7 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
 
   function addProduct(productId) {
     addFetcher.submit(
-      { intent: "add-products", collectionId: activeCollection.id, productIdsJson: JSON.stringify([productId]) },
+      { intent: "add-products", collectionId: activeCollection.id, productIdsJson: JSON.stringify([productId]), sessionId: skuSession?.sessionId ?? "" },
       { method: "POST" }
     );
   }
@@ -2895,35 +2914,39 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
         </div>
 
         {/* ── New Collection — auto-named {initials}{MM/DD/YY}(N) ── */}
-        <div style={{ padding: "12px 16px 0" }}>
-          <button
-            type="button"
-            style={sx.sidebarCreateBtn}
-            onClick={handleNewCollection}
-            disabled={namedFetcher.state !== "idle" || !skuSession}
-            title={!skuSession ? "Sign in to create a collection" : undefined}
-          >
-            {namedFetcher.state !== "idle" ? "Creating…" : "＋ New Collection"}
-          </button>
-          {namedFetcher.data?.namedCollectionError && (
-            <div style={{ fontSize: 12, color: "#d82c0d", marginTop: 6 }}>{namedFetcher.data.namedCollectionError}</div>
-          )}
-        </div>
+        {!isViewer && (
+          <div style={{ padding: "12px 16px 0" }}>
+            <button
+              type="button"
+              style={sx.sidebarCreateBtn}
+              onClick={handleNewCollection}
+              disabled={namedFetcher.state !== "idle" || !skuSession}
+              title={!skuSession ? "Sign in to create a collection" : undefined}
+            >
+              {namedFetcher.state !== "idle" ? "Creating…" : "＋ New Collection"}
+            </button>
+            {namedFetcher.data?.namedCollectionError && (
+              <div style={{ fontSize: 12, color: "#d82c0d", marginTop: 6 }}>{namedFetcher.data.namedCollectionError}</div>
+            )}
+          </div>
+        )}
 
         {/* ── Single Product quick-collection ── */}
-        <div style={{ padding: "12px 16px 0" }}>
-          <button
-            type="button"
-            style={sx.sidebarCreateBtn}
-            onClick={handleSingleProduct}
-            disabled={singlesFetcher.state !== "idle"}
-          >
-            {singlesFetcher.state !== "idle" ? "Loading…" : "Single Product"}
-          </button>
-          {singlesFetcher.data?.singlesError && (
-            <div style={{ fontSize: 12, color: "#d82c0d", marginTop: 6 }}>{singlesFetcher.data.singlesError}</div>
-          )}
-        </div>
+        {!isViewer && (
+          <div style={{ padding: "12px 16px 0" }}>
+            <button
+              type="button"
+              style={sx.sidebarCreateBtn}
+              onClick={handleSingleProduct}
+              disabled={singlesFetcher.state !== "idle"}
+            >
+              {singlesFetcher.state !== "idle" ? "Loading…" : "Single Product"}
+            </button>
+            {singlesFetcher.data?.singlesError && (
+              <div style={{ fontSize: 12, color: "#d82c0d", marginTop: 6 }}>{singlesFetcher.data.singlesError}</div>
+            )}
+          </div>
+        )}
 
         {/* ── No collection selected: show search ── */}
         {!activeCollection && (
@@ -2969,12 +2992,14 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
 
             {query.length >= 2 && (
               <div style={{ marginTop: 6, border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden" }}>
-                <div style={{ ...sx.sidebarCollRow, borderBottom: "1px solid #e1e3e5" }}
-                  onClick={() => !isCreating && quickCreate(query)}>
-                  <div style={{ color: "#005bd3", fontWeight: 600, fontSize: 13 }}>
-                    {isCreating ? "Creating…" : `+ Create "${query}"`}
+                {!isViewer && (
+                  <div style={{ ...sx.sidebarCollRow, borderBottom: "1px solid #e1e3e5" }}
+                    onClick={() => !isCreating && quickCreate(query)}>
+                    <div style={{ color: "#005bd3", fontWeight: 600, fontSize: 13 }}>
+                      {isCreating ? "Creating…" : `+ Create "${query}"`}
+                    </div>
                   </div>
-                </div>
+                )}
                 {isCollSearch && <div style={sx.dropItem}>Searching…</div>}
                 {showCollRes && collResults.length === 0 && <div style={sx.dropItem}>No matches.</div>}
                 {showCollRes && collResults.map(c => (
@@ -3009,37 +3034,39 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
             <div style={{ borderTop: "1px solid #e1e3e5", flex: 1, overflowY: "auto" }}>
 
               {/* Add product row */}
-              {!addingProd ? (
-                <div style={sx.sidebarAddRow} onClick={() => setAddingProd(true)}>
-                  <span style={{ fontSize: 15, color: "#6d7175", marginRight: 6 }}>+</span>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: "#6d7175" }}>Add Product</span>
-                </div>
-              ) : (
-                <div style={{ padding: "10px 12px", borderBottom: "1px solid #e1e3e5", background: "#fafafa" }}>
-                  <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-                    <input style={{ ...sx.input, flex: 1 }} value={prodQuery} onChange={handleProdSearch}
-                      placeholder="Search products…" autoFocus />
-                    <button style={sx.sidebarCloseBtn} onClick={() => { setAddingProd(false); setProdQuery(""); }}>✕</button>
+              {!isViewer && (
+                !addingProd ? (
+                  <div style={sx.sidebarAddRow} onClick={() => setAddingProd(true)}>
+                    <span style={{ fontSize: 15, color: "#6d7175", marginRight: 6 }}>+</span>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: "#6d7175" }}>Add Product</span>
                   </div>
-                  {prodQuery.length >= 2 && (
-                    <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", maxHeight: 200, overflowY: "auto" }}>
-                      {isProdSearch && <div style={sx.dropItem}>Searching…</div>}
-                      {!isProdSearch && prodResults.length === 0 && <div style={sx.dropItem}>No products found.</div>}
-                      {!isProdSearch && prodResults.map(p => (
-                        <div key={p.id} style={{ ...sx.sidebarCollRow, display: "flex", alignItems: "center", gap: 8 }}
-                          onClick={() => addProduct(p.id)}>
-                          {p.featuredImage?.url
-                            ? <img src={p.featuredImage.url} alt="" style={{ width: 28, height: 28, objectFit: "cover", borderRadius: 3, flexShrink: 0 }} />
-                            : <div style={{ width: 28, height: 28, background: "#f1f1f1", borderRadius: 3, flexShrink: 0 }} />}
-                          <div style={{ minWidth: 0 }}>
-                            <div style={{ fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.title}</div>
-                            <div style={{ fontSize: 10, color: "#6d7175" }}>{p.variants?.edges?.[0]?.node?.sku ?? ""}</div>
-                          </div>
-                        </div>
-                      ))}
+                ) : (
+                  <div style={{ padding: "10px 12px", borderBottom: "1px solid #e1e3e5", background: "#fafafa" }}>
+                    <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                      <input style={{ ...sx.input, flex: 1 }} value={prodQuery} onChange={handleProdSearch}
+                        placeholder="Search products…" autoFocus />
+                      <button style={sx.sidebarCloseBtn} onClick={() => { setAddingProd(false); setProdQuery(""); }}>✕</button>
                     </div>
-                  )}
-                </div>
+                    {prodQuery.length >= 2 && (
+                      <div style={{ border: "1px solid #e1e3e5", borderRadius: 6, overflow: "hidden", maxHeight: 200, overflowY: "auto" }}>
+                        {isProdSearch && <div style={sx.dropItem}>Searching…</div>}
+                        {!isProdSearch && prodResults.length === 0 && <div style={sx.dropItem}>No products found.</div>}
+                        {!isProdSearch && prodResults.map(p => (
+                          <div key={p.id} style={{ ...sx.sidebarCollRow, display: "flex", alignItems: "center", gap: 8 }}
+                            onClick={() => addProduct(p.id)}>
+                            {p.featuredImage?.url
+                              ? <img src={p.featuredImage.url} alt="" style={{ width: 28, height: 28, objectFit: "cover", borderRadius: 3, flexShrink: 0 }} />
+                              : <div style={{ width: 28, height: 28, background: "#f1f1f1", borderRadius: 3, flexShrink: 0 }} />}
+                            <div style={{ minWidth: 0 }}>
+                              <div style={{ fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.title}</div>
+                              <div style={{ fontSize: 10, color: "#6d7175" }}>{p.variants?.edges?.[0]?.node?.sku ?? ""}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
               )}
 
               {/* Product rows */}
@@ -3063,7 +3090,7 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
                         textDecoration: pending ? "line-through" : undefined }}>{p.title}</div>
                       {sku && <div style={{ fontSize: 10, color: "#6d7175" }}>SKU: {sku}</div>}
                     </div>
-                    {pending ? (
+                    {!isViewer && (pending ? (
                       <button
                         style={{ fontSize: 11, fontWeight: 600, color: "#005bd3", background: "none", border: "none", cursor: "pointer", padding: "2px 4px", flexShrink: 0 }}
                         onClick={e => { e.stopPropagation(); undoRemove(p.id); }}
@@ -3074,7 +3101,7 @@ function CollectionSidebar({ activeCollection, products, onSelect, onDeselect, o
                         onClick={e => { e.stopPropagation(); removeProduct(p.id); }}
                         title="Remove from collection"
                       >×</button>
-                    )}
+                    ))}
                   </div>
                 );
               })}
@@ -3128,9 +3155,9 @@ export default function PrepB() {
   }, [products]);
 
   // Store-wide suggestion lists — shared across every ProductRow, like allSkus above.
-  const vendorSuggest = usePaginatedSuggestions("vendor", vendorSuggestions);
-  const typeSuggest   = usePaginatedSuggestions("type",   typeSuggestions);
-  const tagSuggest    = usePaginatedSuggestions("tag",    tagSuggestions);
+  const vendorSuggest = usePaginatedSuggestions("vendor", vendorSuggestions, skuSession?.sessionId);
+  const typeSuggest   = usePaginatedSuggestions("type",   typeSuggestions,   skuSession?.sessionId);
+  const tagSuggest    = usePaginatedSuggestions("tag",    tagSuggestions,    skuSession?.sessionId);
 
   const filteredProducts = useMemo(() => {
     let list = [...products];
@@ -3174,11 +3201,11 @@ export default function PrepB() {
   const deleteFetcher = useFetcher();
 
   function handleRenameConfirm() {
-    renameFetcher.submit({ intent: "rename-collection", collectionId: collection.id, title: renameValue }, { method: "POST" });
+    renameFetcher.submit({ intent: "rename-collection", collectionId: collection.id, title: renameValue, sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
   }
 
   function handleDeleteConfirm() {
-    deleteFetcher.submit({ intent: "delete-collection", collectionId: collection.id }, { method: "POST" });
+    deleteFetcher.submit({ intent: "delete-collection", collectionId: collection.id, sessionId: skuSession?.sessionId ?? "" }, { method: "POST" });
   }
 
   useEffect(() => {
@@ -3314,6 +3341,7 @@ export default function PrepB() {
                     collectionId={collection.id}
                     onRemoved={() => setSearchParams({ collectionId: collection.id })}
                     highlighted={highlightedProductId === p.id}
+                    skuSession={skuSession}
                   />
                 ))
               )}
@@ -3321,6 +3349,7 @@ export default function PrepB() {
               <AddProductsRow
                 collectionId={collection.id}
                 onAdded={() => setSearchParams({ collectionId: collection.id })}
+                skuSession={skuSession}
               />
             </div>
 

@@ -123,6 +123,11 @@ export async function validateAccessKey({ userId, shopId }) {
   };
 }
 
+// --- Whether a validated session is allowed to perform a mutating action ---
+export function isMutationAllowed(skuSession) {
+  return !!skuSession && skuSession.role !== "viewer";
+}
+
 // --- Delete a session (sign out) ---
 export async function deleteSkuSession(sessionId) {
   if (!sessionId) return;
