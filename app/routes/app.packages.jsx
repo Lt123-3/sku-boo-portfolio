@@ -7,7 +7,7 @@
 import { authenticate }         from "../shopify.server.js";
 import { useFetcher, useLoaderData } from "react-router";
 import { useState, useEffect }  from "react";
-import { validateSkuSession }   from "../lib/access.server.js";
+import { validateSkuSession, isMutationAllowed } from "../lib/access.server.js";
 import prisma                   from "../db.server.js";
 import { PinOverlay, UserBadge, useSkuSession } from "../components/PinGate.jsx";
 
@@ -50,8 +50,8 @@ export async function action({ request }) {
   const intent    = formData.get("intent");
 
   const skuSession = await validateSkuSession({ sessionId, shopId });
-  if (!skuSession)                 return Response.json({ success: false, error: "Unauthorized — please sign in." });
-  if (skuSession.role !== "admin") return Response.json({ success: false, error: "Forbidden — admin access required." });
+  if (!skuSession)                    return Response.json({ success: false, error: "Unauthorized — please sign in." });
+  if (!isMutationAllowed(skuSession)) return Response.json({ success: false, error: "Forbidden — viewers can't edit packages." });
 
   if (intent === "add_package") {
     const name = formData.get("name")?.toString().trim();
@@ -100,7 +100,7 @@ export async function action({ request }) {
 }
 
 // ── Package Row ───────────────────────────────────────────────────────────────
-function PackageRow({ pkg, sessionId, fetcher, index }) {
+function PackageRow({ pkg, sessionId, fetcher, index, isViewer }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft]     = useState({ length: pkg.length, width: pkg.width, height: pkg.height ?? "" });
 
@@ -140,10 +140,14 @@ function PackageRow({ pkg, sessionId, fetcher, index }) {
           <td style={td}>{pkg.width}{'"'}</td>
           <td style={td}>{pkg.height != null ? `${pkg.height}"` : <span style={{ color: "#6d7175" }}>— estimated</span>}</td>
           <td style={td}>
-            <div style={{ display: "flex", gap: "8px" }}>
-              <s-button variant="secondary" onClick={() => setEditing(true)}>Edit</s-button>
-              <s-button variant="tertiary" tone="critical" onClick={remove}>Delete</s-button>
-            </div>
+            {isViewer ? (
+              <span style={{ color: "#6d7175" }}>View only</span>
+            ) : (
+              <div style={{ display: "flex", gap: "8px" }}>
+                <s-button variant="secondary" onClick={() => setEditing(true)}>Edit</s-button>
+                <s-button variant="tertiary" tone="critical" onClick={remove}>Delete</s-button>
+              </div>
+            )}
           </td>
         </>
       )}
@@ -195,7 +199,7 @@ export default function PackagesPage() {
     );
   }
 
-  const isForbidden = skuSession && skuSession.role !== "admin";
+  const isViewer = skuSession?.role === "viewer";
 
   return (
     <>
@@ -203,77 +207,69 @@ export default function PackagesPage() {
       <s-page heading="SKU Boo — Saved Packages">
         {skuSession && <UserBadge username={skuSession.username} onSignOut={handleSignOut} />}
 
-        {isForbidden ? (
-          <s-section>
-            <div style={{ fontSize: "16px", color: "#d82c0d", padding: "32px", textAlign: "center" }}>
-              Forbidden — Saved Packages requires admin access.
-              <br />
-              Signed in as {skuSession.username} ({skuSession.role}).
-            </div>
-          </s-section>
-        ) : (
-      <s-section>
-        <div style={{ fontSize: "14px", color: "#6d7175", marginBottom: "20px", lineHeight: "1.6", maxWidth: "600px" }}>
-          This is the shared list of box/envelope presets used both by the rate-check
-          extension and the shipping-desk device — editing here updates it everywhere.
-        </div>
-
-        <div style={{ background: "#f6f6f7", borderRadius: "10px", padding: "20px 24px", marginBottom: "24px" }}>
-          <div style={{ fontSize: "15px", fontWeight: "700", color: "#202223", marginBottom: "16px" }}>Add a Package</div>
-          <div style={{ display: "flex", gap: "16px", alignItems: "flex-end", flexWrap: "wrap" }}>
-            <div>
-              <div style={labelStyle}>Name</div>
-              <input
-                style={inputStyle}
-                placeholder="17 Cube (Default)"
-                value={newPackage.name}
-                onChange={(e) => setNewPackage((p) => ({ ...p, name: e.target.value }))}
-              />
-            </div>
-            <div>
-              <div style={labelStyle}>Length (in)</div>
-              <input style={{ ...inputStyle, width: "90px" }} value={newPackage.length} onChange={(e) => setNewPackage((p) => ({ ...p, length: e.target.value }))} />
-            </div>
-            <div>
-              <div style={labelStyle}>Width (in)</div>
-              <input style={{ ...inputStyle, width: "90px" }} value={newPackage.width} onChange={(e) => setNewPackage((p) => ({ ...p, width: e.target.value }))} />
-            </div>
-            <div>
-              <div style={labelStyle}>Height (in) <span style={{ color: "#6d7175", fontWeight: "400" }}>(optional)</span></div>
-              <input style={{ ...inputStyle, width: "90px" }} value={newPackage.height} onChange={(e) => setNewPackage((p) => ({ ...p, height: e.target.value }))} />
-            </div>
-            <s-button onClick={handleAdd} variant="primary">Add Package</s-button>
+        <s-section>
+          <div style={{ fontSize: "14px", color: "#6d7175", marginBottom: "20px", lineHeight: "1.6", maxWidth: "600px" }}>
+            This is the shared list of box/envelope presets used both by the rate-check
+            extension and the shipping-desk device — editing here updates it everywhere.
           </div>
 
-          {message && (
-            <div style={{ marginTop: "14px", fontSize: "14px", fontWeight: "600", color: message.type === "error" ? "#d82c0d" : "#008060" }}>
-              {message.type === "error" ? "✗" : "✓"} {message.text}
+          {!isViewer && (
+            <div style={{ background: "#f6f6f7", borderRadius: "10px", padding: "20px 24px", marginBottom: "24px" }}>
+              <div style={{ fontSize: "15px", fontWeight: "700", color: "#202223", marginBottom: "16px" }}>Add a Package</div>
+              <div style={{ display: "flex", gap: "16px", alignItems: "flex-end", flexWrap: "wrap" }}>
+                <div>
+                  <div style={labelStyle}>Name</div>
+                  <input
+                    style={inputStyle}
+                    placeholder="17 Cube (Default)"
+                    value={newPackage.name}
+                    onChange={(e) => setNewPackage((p) => ({ ...p, name: e.target.value }))}
+                  />
+                </div>
+                <div>
+                  <div style={labelStyle}>Length (in)</div>
+                  <input style={{ ...inputStyle, width: "90px" }} value={newPackage.length} onChange={(e) => setNewPackage((p) => ({ ...p, length: e.target.value }))} />
+                </div>
+                <div>
+                  <div style={labelStyle}>Width (in)</div>
+                  <input style={{ ...inputStyle, width: "90px" }} value={newPackage.width} onChange={(e) => setNewPackage((p) => ({ ...p, width: e.target.value }))} />
+                </div>
+                <div>
+                  <div style={labelStyle}>Height (in) <span style={{ color: "#6d7175", fontWeight: "400" }}>(optional)</span></div>
+                  <input style={{ ...inputStyle, width: "90px" }} value={newPackage.height} onChange={(e) => setNewPackage((p) => ({ ...p, height: e.target.value }))} />
+                </div>
+                <s-button onClick={handleAdd} variant="primary">Add Package</s-button>
+              </div>
+
+              {message && (
+                <div style={{ marginTop: "14px", fontSize: "14px", fontWeight: "600", color: message.type === "error" ? "#d82c0d" : "#008060" }}>
+                  {message.type === "error" ? "✗" : "✓"} {message.text}
+                </div>
+              )}
             </div>
           )}
-        </div>
 
-        {packages.length === 0 ? (
-          <div style={{ fontSize: "14px", color: "#6d7175" }}>No saved packages yet.</div>
-        ) : (
-          <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: "0", fontSize: "14px" }}>
-            <thead>
-              <tr style={{ background: "#f6f6f7" }}>
-                {["Name", "Length", "Width", "Height", "Action"].map((h) => (
-                  <th key={h} style={{ padding: "12px 16px", fontWeight: "700", color: "#202223", fontSize: "13px", textAlign: "left", borderBottom: "2px solid #e1e3e5" }}>
-                    {h}
-                  </th>
+          {packages.length === 0 ? (
+            <div style={{ fontSize: "14px", color: "#6d7175" }}>No saved packages yet.</div>
+          ) : (
+            <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: "0", fontSize: "14px" }}>
+              <thead>
+                <tr style={{ background: "#f6f6f7" }}>
+                  {["Name", "Length", "Width", "Height", "Action"].map((h) => (
+                    <th key={h} style={{ padding: "12px 16px", fontWeight: "700", color: "#202223", fontSize: "13px", textAlign: "left", borderBottom: "2px solid #e1e3e5" }}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {packages.map((pkg, i) => (
+                  <PackageRow key={pkg.id} pkg={pkg} sessionId={skuSession?.sessionId ?? ""} fetcher={fetcher} index={i} isViewer={isViewer} />
                 ))}
-              </tr>
-            </thead>
-            <tbody>
-              {packages.map((pkg, i) => (
-                <PackageRow key={pkg.id} pkg={pkg} sessionId={skuSession?.sessionId ?? ""} fetcher={fetcher} index={i} />
-              ))}
-            </tbody>
-          </table>
-        )}
-      </s-section>
-        )}
+              </tbody>
+            </table>
+          )}
+        </s-section>
       </s-page>
     </>
   );
