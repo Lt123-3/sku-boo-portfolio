@@ -20,6 +20,23 @@ const shopify = shopifyApp({
   future: {
     expiringOfflineAccessTokens: true,
   },
+  webhooks: {
+    ApiVersion: ApiVersion.October25,
+    deliveryMethod: "Http",
+    endpointApiVersion: "2026-07",
+  },
+  hooks: {
+    afterAuth: async (request) => {
+      const { admin, session } = await shopify.authenticate.admin(request);
+      if (!session || !admin) return;
+      try {
+        await shopify.registerWebhooks({ session });
+        console.log("[afterAuth] Webhooks registered for shop:", session.shop);
+      } catch (err) {
+        console.error("[afterAuth] Failed to register webhooks:", session.shop, err);
+      }
+    },
+  },
   ...(process.env.SHOP_CUSTOM_DOMAIN
     ? { customShopDomains: [process.env.SHOP_CUSTOM_DOMAIN] }
     : {}),
