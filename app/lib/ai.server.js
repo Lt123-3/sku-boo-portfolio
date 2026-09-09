@@ -245,7 +245,7 @@ export function sanitizeGeneratedText(raw) {
 }
 
 // Stable, structured product context first; research/instruction context
-// goes last, after everything the cached system prompt covers.
+// goes last, after the (potentially cached) system prompt.
 function buildUserPrompt({ kind, productContext, additionalInstruction, comparableResearch }) {
   const lines = ["Product details:"];
   const push = (label, value) => {
@@ -371,11 +371,17 @@ async function logAiUsageSafely({ shopId, callType, model, usage }) {
 // this only runs once per product, not once per field-click.
 async function researchComparableListings({ shopId, productContext, settings }) {
   const client = new Anthropic({ apiKey: settings.apiKey });
+  // cache_control here is currently a permanent no-op: RESEARCH_SYSTEM_PROMPT
+  // is ~110 tokens and hardcoded (no AI Settings control over it), while
+  // claude-haiku-4-5 only caches prefixes above ~4096 tokens. Kept for
+  // symmetry with the writer call, and in case this prompt ever grows or
+  // becomes configurable. Default 5-min TTL for the same reason as there —
+  // see generateProductText's cache_control comment for the full rationale.
   const requestParams = {
     model: RESEARCH_MODEL,
     max_tokens: 1000,
     system: [
-      { type: "text", text: RESEARCH_SYSTEM_PROMPT, cache_control: { type: "ephemeral", ttl: "1h" } },
+      { type: "text", text: RESEARCH_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
     ],
     messages: [{ role: "user", content: buildResearchPrompt(productContext) }],
     tools: [webSearchTool(RESEARCH_MODEL)],
@@ -452,10 +458,20 @@ export async function generateProductText({
   // No more +1000 web-search headroom — the writer no longer runs its own
   // tool-use turns, so it never needs it.
   const maxTokens = kind === "title" ? 500 : 2000;
+  // cache_control below is inert for the built-in prompts: prefix caching
+  // only engages above a per-model minimum (~512 tokens for claude-opus-5,
+  // ~1024 for claude-sonnet-5, ~4096 for claude-haiku-4-5), and the default
+  // title/description prompts are only ~130 tokens each. It starts doing
+  // something only once a shop pastes a long custom prompt into AI Settings
+  // that clears that bar — it's kept for exactly that case. Default 5-min
+  // TTL, not "1h": Prep is a bulk tool, Generate clicks land seconds-to-
+  // minutes apart and keep the window warm, and the cache-write premium is
+  // 1.25x vs 2x for "1h". Confirm with AiUsageLog.cacheReadTokens before
+  // assuming this saves anything.
   const requestParams = {
     model: settings.model,
     max_tokens: maxTokens,
-    system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral", ttl: "1h" } }],
+    system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
     messages: [
       {
         role: "user",

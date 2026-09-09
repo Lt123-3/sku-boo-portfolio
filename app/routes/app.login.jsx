@@ -8,8 +8,8 @@ import { validateAccessKey, createSkuSession } from "../lib/access.server.js";
 // --- Simple in-memory PIN lockout ---
 // Tracks failed attempts per shop+userId. Not persisted across server
 // restarts — fine for throttling a 4-digit PIN on a small internal tool.
-const MAX_ATTEMPTS = 5;
-const LOCKOUT_MS    = 5 * 60 * 1000; // 5 minutes
+const MAX_ATTEMPTS = 4;
+const LOCKOUT_MS    = 1 * 60 * 1000; // 1 minutes
 const failedAttempts = new Map(); // key -> { count, lockedUntil }
 
 function attemptKey(shopId, userId) {
