@@ -173,7 +173,7 @@ const EXISTING_DESCRIPTION_MAX_CHARS = 400;
 // Relocated from app/routes/app.prepb.jsx:92-107 — was dead code there
 // (confirmed zero call sites), now used to shrink bodyHtml for the
 // generation prompt below.
-function htmlToText(html) {
+export function htmlToText(html) {
   if (!html) return "";
   return html
     .replace(/<br\s*\/?>/gi, "\n")
@@ -191,7 +191,7 @@ function htmlToText(html) {
 }
 
 // Cuts at the last word boundary at or before maxChars, never mid-word.
-function truncateAtWordBoundary(text, maxChars) {
+export function truncateAtWordBoundary(text, maxChars) {
   const collapsed = text.replace(/\s+/g, " ").trim();
   if (collapsed.length <= maxChars) return collapsed;
   const slice = collapsed.slice(0, maxChars);

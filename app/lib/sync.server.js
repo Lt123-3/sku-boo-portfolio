@@ -26,7 +26,7 @@ const TRACKED_FIELDS = [
 ];
 
 // ── Rate limit helper ─────────────────────────────────────────────────────────
-function getThrottleDelay(responseData, baseDelay) {
+export function getThrottleDelay(responseData, baseDelay) {
   const cost = responseData?.extensions?.cost;
   if (!cost) return baseDelay;
 
@@ -45,7 +45,7 @@ function getThrottleDelay(responseData, baseDelay) {
 }
 
 // ── ETA helper ────────────────────────────────────────────────────────────────
-function formatEta(processed, total, startTime) {
+export function formatEta(processed, total, startTime) {
   if (!startTime || processed === 0) return null;
   const elapsedMs     = Date.now() - new Date(startTime).getTime();
   const msPerProduct  = elapsedMs / processed;
@@ -57,7 +57,7 @@ function formatEta(processed, total, startTime) {
 }
 
 // ── Problem detection ─────────────────────────────────────────────────────────
-function detectProblems(product, variant) {
+export function detectProblems(product, variant) {
   const problems = [];
   const sku   = variant?.sku  ?? null;
   const title = product.title ?? null;
