@@ -2,10 +2,14 @@
 
 import { authenticate }                          from "../shopify.server.js";
 import { useFetcher, useLoaderData, useNavigate } from "react-router";
-import { useState, useEffect }                   from "react";
+import { useState, useEffect, useRef }           from "react";
 import { validateSkuSession }                    from "../lib/access.server.js";
 import { validateRole }                          from "../lib/validate.server.js";
+import { backoffDelayMs, nextFailureCount }      from "../lib/autoPaginate.js";
 import prisma                                    from "../db.server.js";
+
+// Base cadence for the sync-status poll; failed polls back off past this.
+const POLL_INTERVAL_MS = 2000;
 
 // ── Loader ────────────────────────────────────────────────────────────────────
 export async function loader({ request }) {
@@ -268,6 +272,15 @@ export default function AdminPage() {
   const [selectedPass, setSelectedPass] = useState("both");
   const [isPolling,    setIsPolling]    = useState(false);
 
+  const submitStatus          = statusFetcher.submit; // stable across renders in react-router v7
+  const pollFailuresRef       = useRef(0);
+  const pollTimerRef          = useRef(null);
+  // Generation counter (not a statusFetcher.state edge) for settle detection —
+  // React can coalesce idle -> submitting -> idle when a poll resolves fast.
+  const pollGenRef            = useRef(0);
+  const processedPollGenRef   = useRef(0);
+  const [pollTick,   setPollTick]   = useState(0);
+
   const sessionId = typeof window !== "undefined"
     ? sessionStorage.getItem("skuboo_session_id") ?? ""
     : "";
@@ -280,32 +293,67 @@ export default function AdminPage() {
 
   useEffect(() => { if (isRunning) setIsPolling(true); }, [isRunning]);
 
+  // Fold each settled poll into the failure count, then apply its data. One
+  // generation is processed exactly once, so a coalesced idle->idle transition
+  // or a repeated 401 body still counts. `setPollTick` at the end wakes the
+  // scheduler to queue the next poll.
   useEffect(() => {
-    if (!isPolling) return;
-    const interval = setInterval(() => {
-      statusFetcher.submit(
-        { intent: "sync_status", sessionId },
-        { method: "POST", action: "/app/admin" }
-      );
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [isPolling, sessionId]);
+    if (statusFetcher.state !== "idle") return; // still in flight
+    if (pollGenRef.current === processedPollGenRef.current) return; // nothing new settled
+    processedPollGenRef.current = pollGenRef.current;
 
-  useEffect(() => {
-    if (!statusFetcher.data) return;
-    if (statusFetcher.data.syncState) {
+    const gotStatus = Boolean(statusFetcher.data?.syncState);
+    pollFailuresRef.current = nextFailureCount(pollFailuresRef.current, !gotStatus);
+    if (!gotStatus && backoffDelayMs(pollFailuresRef.current) >= 30000) {
+      setSyncMessage("Lost connection to sync status — reload the page to resume.");
+    }
+
+    if (gotStatus) {
       const s = statusFetcher.data.syncState;
       setSyncState(s);
       if (s.status !== "running") setIsPolling(false);
     }
-    if (statusFetcher.data.skuIndexTotal !== undefined) {
+    if (statusFetcher.data?.skuIndexTotal !== undefined) {
       setLiveStats((prev) => ({
         ...prev,
         skuIndexTotal:    statusFetcher.data.skuIndexTotal,
         productInfoTotal: statusFetcher.data.productInfoTotal,
       }));
     }
-  }, [statusFetcher.data]);
+
+    setPollTick((t) => t + 1);
+  }, [statusFetcher.state, statusFetcher.data]);
+
+  // Self-scheduling status poll. After a failed poll the next one is delayed by
+  // backoffDelayMs() instead of firing on a fixed 2s interval forever, so an
+  // expired session / rejected Shopify token can't flood /app/admin.
+  useEffect(() => {
+    if (!isPolling) {
+      if (pollTimerRef.current != null) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+      pollFailuresRef.current = 0; // fresh start next time polling begins
+      return;
+    }
+    if (pollGenRef.current !== processedPollGenRef.current) return; // a poll is in flight / unprocessed
+    if (pollTimerRef.current != null) return;                       // next poll already scheduled
+
+    const delay = Math.max(POLL_INTERVAL_MS, backoffDelayMs(pollFailuresRef.current));
+    pollTimerRef.current = setTimeout(() => {
+      pollTimerRef.current = null;
+      pollGenRef.current += 1;
+      submitStatus(
+        { intent: "sync_status", sessionId },
+        { method: "POST", action: "/app/admin" },
+      );
+    }, delay);
+  }, [isPolling, sessionId, pollTick, submitStatus]);
+
+  // Clear a pending poll on unmount.
+  useEffect(() => () => {
+    if (pollTimerRef.current != null) clearTimeout(pollTimerRef.current);
+  }, []);
 
   useEffect(() => {
     if (!fetcher.data) return;

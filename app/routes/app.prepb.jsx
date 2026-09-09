@@ -8,6 +8,7 @@ import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { generateProductText } from "../lib/ai.server.js";
 import { PinOverlay, UserBadge, useSkuSession } from "../components/PinGate.jsx";
+import { usePaginatedSuggestions } from "../hooks/usePaginatedSuggestions.js";
 import { validateSkuSession, isMutationAllowed } from "../lib/access.server.js";
 import prisma from "../db.server.js";
 
@@ -25,7 +26,6 @@ const PRODUCTS_COUNT       = 50;
 const VARIANTS_COUNT       = 50;
 const SEARCH_COUNT         = 10;
 const SUGGEST_PAGE_SIZE    = 250;
-const SUGGEST_AUTOLOAD_CAP = 2000;
 
 // Normalizes a StringConnection (productVendors/productTypes/productTags) into
 // the page shape usePaginatedSuggestions expects, whether it came from the
@@ -991,45 +991,6 @@ function TagEditor({ tags, onChange, suggestions = [], hasNextPage = false, load
       )}
     </div>
   );
-}
-
-// ── usePaginatedSuggestions — cursor-paginated, store-wide suggestion list ────
-// Shared at the Prep page level (like allSkus) rather than per-row: vendor/type/
-// tag values aren't per-product, so every row should see the same loaded pages.
-function usePaginatedSuggestions(field, initialPage, sessionId) {
-  const fetcher = useFetcher();
-  const [state, setState] = useState({
-    nodes: initialPage.nodes,
-    hasNextPage: initialPage.hasNextPage,
-    endCursor: initialPage.endCursor,
-  });
-
-  useEffect(() => {
-    const result = fetcher.data?.suggestMore;
-    if (!result || result.field !== field) return;
-    setState(prev => ({
-      nodes: [...new Set([...prev.nodes, ...result.nodes])],
-      hasNextPage: result.hasNextPage,
-      endCursor: result.endCursor,
-    }));
-  }, [fetcher.data, field]);
-
-  function loadMore() {
-    if (!state.hasNextPage || fetcher.state !== "idle") return;
-    fetcher.submit({ intent: "suggest-more", field, after: state.endCursor ?? "", sessionId: sessionId ?? "" }, { method: "POST" });
-  }
-
-  // Auto-walk every page in the background (typing should be able to search
-  // the whole store, not just whatever's been manually loaded) up to a safety
-  // cap, past which "Load more" becomes a manual fallback for huge stores.
-  useEffect(() => {
-    if (!state.hasNextPage) return;
-    if (state.nodes.length >= SUGGEST_AUTOLOAD_CAP) return;
-    if (fetcher.state !== "idle") return;
-    loadMore();
-  }, [state.hasNextPage, state.nodes.length, fetcher.state]);
-
-  return { nodes: state.nodes, hasNextPage: state.hasNextPage, loading: fetcher.state !== "idle", loadMore };
 }
 
 // ── SuggestField — text field with a filtered, paginated suggestion dropdown ──
