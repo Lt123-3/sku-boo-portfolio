@@ -1,18 +1,18 @@
 // app/routes/webhooks.products.update.jsx
 
 import { authenticate } from "../shopify.server.js";
-import { upsertSkuIndexRow } from "../lib/sync.server.js";
+import { syncSkuIndexRowFromWebhook } from "../lib/sync.server.js";
 
 export const action = async ({ request }) => {
-  const { topic, shop, payload } = await authenticate.webhook(request);
+  const { shop, admin, payload } = await authenticate.webhook(request);
 
   console.log("[webhook] products/update from shop:", shop);
 
   try {
-    await upsertSkuIndexRow(payload, shop);
-    console.log("[webhook] Upserted updated product:", payload.id);
+    await syncSkuIndexRowFromWebhook(admin, payload.admin_graphql_api_id, shop);
+    console.log("[webhook] Synced updated product:", payload.admin_graphql_api_id);
   } catch (err) {
-    console.error("[webhook] Failed to upsert on update:", err);
+    console.error("[webhook] Failed to sync on update:", err);
   }
 
   return new Response(null, { status: 200 });

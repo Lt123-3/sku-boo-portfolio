@@ -345,7 +345,25 @@ export async function detectAndWriteChanges(product, shopId) {
 export async function handleProductDeleted(productId, shopId) {
   try {
     const existing = await prisma.skuIndex.findFirst({ where: { productId, shopId } });
-    if (!existing) return;
+    if (!existing) {
+      // No match means the SKU is never freed. Log enough to tell an ID-format
+      // mismatch apart from a shop mismatch apart from a genuinely unknown product
+      // — a fixed ID format won't help if this starts failing for another reason.
+      const anyShop = await prisma.skuIndex.findFirst({
+        where: { productId },
+        select: { shopId: true },
+      });
+      console.warn(
+        "[handleProductDeleted] No SkuIndex match — SKU not freed:",
+        JSON.stringify({
+          productId,
+          productIdType: typeof productId,
+          shopId,
+          existsUnderOtherShop: anyShop?.shopId ?? null,
+        })
+      );
+      return;
+    }
 
     await prisma.skuIndex.update({
       where: { id: existing.id },
@@ -368,7 +386,11 @@ export async function handleProductDeleted(productId, shopId) {
 
     console.log("[handleProductDeleted] Marked deleted:", productId);
   } catch (err) {
-    console.error("[handleProductDeleted] Failed:", err);
+    console.error(
+      "[handleProductDeleted] Failed:",
+      JSON.stringify({ productId, shopId }),
+      err
+    );
   }
 }
 
@@ -407,6 +429,66 @@ export async function runDripSync(admin, shopId) {
   }
 
   console.log("[dripSync] Complete. Processed:", products.length);
+}
+
+// ── Webhook re-fetch ─────────────────────────────────────────────────────────
+// Keep this field selection identical to getDripProducts above.
+const WEBHOOK_PRODUCT_QUERY = `#graphql
+  query getWebhookProduct($id: ID!) {
+    product(id: $id) {
+      id title status createdAt updatedAt
+      variants(first: 1) { edges { node { sku } } }
+      featuredImage { url }
+    }
+  }`;
+
+// products/create and products/update webhooks deliver REST-shaped payloads, but
+// upsertSkuIndexRow expects a GraphQL product node. Re-fetch by the admin GID
+// (payload.admin_graphql_api_id) in the drip shape, then upsert. Mirrors
+// runDripSync's guard style: log and bail rather than feed a partial object in.
+export async function syncSkuIndexRowFromWebhook(admin, adminGraphqlApiId, shopId) {
+  if (!admin) {
+    console.warn(
+      "[syncSkuIndexRowFromWebhook] No admin client (shop uninstalled / CLI-triggered). Skipping:",
+      adminGraphqlApiId,
+      shopId
+    );
+    return;
+  }
+
+  let product;
+  try {
+    const response = await admin.graphql(WEBHOOK_PRODUCT_QUERY, {
+      variables: { id: adminGraphqlApiId },
+    });
+    const data = await response.json();
+    if (data.errors) {
+      console.error(
+        "[syncSkuIndexRowFromWebhook] GraphQL errors:",
+        adminGraphqlApiId,
+        JSON.stringify(data.errors)
+      );
+      return;
+    }
+    product = data.data?.product;
+  } catch (err) {
+    console.error(
+      "[syncSkuIndexRowFromWebhook] Re-fetch failed:",
+      adminGraphqlApiId,
+      err
+    );
+    return;
+  }
+
+  if (!product) {
+    console.warn(
+      "[syncSkuIndexRowFromWebhook] Product not found (deleted before re-fetch?):",
+      adminGraphqlApiId
+    );
+    return;
+  }
+
+  await upsertSkuIndexRow(product, shopId);
 }
 
 // ── Background cron ───────────────────────────────────────────────────────────
