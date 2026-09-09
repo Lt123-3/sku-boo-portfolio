@@ -1,0 +1,29 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Several app/lib/*.server.js modules construct PrismaClient at import
+      # time, so the generated client must exist before Vitest loads them.
+      # (`npm test` also runs this via its pretest hook — kept explicit here so
+      # the typecheck step below can rely on it too.)
+      - run: npx prisma generate
+
+      - run: npm test
+
+      # typecheck is green today, so it gates CI. `npm run lint` is deliberately
+      # NOT a step yet: it currently reports ~344 pre-existing errors (mostly
+      # react/prop-types). Add it once that backlog is cleared.
+      - run: npm run typecheck
