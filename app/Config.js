@@ -35,6 +35,7 @@ export const SKU_PROBLEMS = {
   NO_TITLE:      "no_title",      // no title at all
   NO_TITLE_SKU:  "no_title_sku",  // has title body but missing number prefix
   NO_TITLE_BODY: "no_title_body", // has number prefix but no body (unused SKU?)
-  NO_PIC:        "no_pic",
+  NO_PIC:        "no_pic",        // 0 image-type media
+  LOW_PIC:       "low_pic",       // 1–2 image-type media
   NO_PREP:       "no_prep",
 }

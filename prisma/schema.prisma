@@ -55,6 +55,7 @@ model SkuIndex {
   status           String    @default("free") // free | active | reserved | problem | deleted
   problems         String? // JSON array e.g. '["no_title","no_pic"]'
   excludedProblems String? // JSON array — problems permanently excluded from detection
+  imageCount       Int? // # of image-type media on the product, capped at 10 (null = not synced yet)
   warehouseStatus  String? // reserved for future warehouse features
   reservedAt       DateTime? // stores Shopify product.createdAt on sync
   reservedBy       String? // access key of the user who reserved it
