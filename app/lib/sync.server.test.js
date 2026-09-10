@@ -72,14 +72,45 @@ describe("detectProblems", () => {
     ).toEqual([]);
   });
 
-  it("flags no_pic when there is no featured image", () => {
+  it("flags no_pic when the featuredImage-shape payload has no image", () => {
     const { variant } = cleanProduct();
     expect(
       detectProblems({ title: "123456 - Lamp", featuredImage: null }, variant),
     ).toEqual(["no_pic"]);
+  });
+
+  it("flags no_pic when the media-shape payload carries no image", () => {
+    const { variant } = cleanProduct();
+    expect(
+      detectProblems({ title: "123456 - Lamp", media: { edges: [] } }, variant),
+    ).toEqual(["no_pic"]);
+    // media present but only a non-image (video / 3d model) → still no picture
+    expect(
+      detectProblems(
+        { title: "123456 - Lamp", media: { edges: [{ node: {} }] } },
+        variant,
+      ),
+    ).toEqual(["no_pic"]);
+  });
+
+  it("does not flag no_pic when the media-shape payload has an image", () => {
+    const { variant } = cleanProduct();
+    expect(
+      detectProblems(
+        {
+          title: "123456 - Lamp",
+          media: { edges: [{ node: { image: { url: "https://cdn.example/x.jpg" } } }] },
+        },
+        variant,
+      ),
+    ).toEqual([]);
+  });
+
+  it("leaves no_pic unjudged when the payload fetched no image field at all", () => {
+    const { variant } = cleanProduct();
     expect(
       detectProblems({ title: "123456 - Lamp" }, variant),
-    ).toEqual(["no_pic"]);
+    ).toEqual([]);
   });
 
   it("accumulates every problem, in detection order", () => {

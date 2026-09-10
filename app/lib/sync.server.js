@@ -74,7 +74,17 @@ export function detectProblems(product, variant) {
     if (hasTitleSku  && !hasTitleBody) problems.push(SKU_PROBLEMS.NO_TITLE_BODY);
   }
 
-  if (!product.featuredImage) problems.push(SKU_PROBLEMS.NO_PIC);
+  // no_pic — judge only from image data the payload actually included. The drip /
+  // webhook / Pass 1 queries select `featuredImage`; the cron / Pass 2 queries
+  // select `media(first: 10)` instead and never `featuredImage`. Reading
+  // `featuredImage` on a media-shape payload is a false positive, so leave the
+  // dimension alone when neither field was fetched.
+  if ("featuredImage" in product) {
+    if (!product.featuredImage) problems.push(SKU_PROBLEMS.NO_PIC);
+  } else if (product.media) {
+    const hasImage = (product.media.edges ?? []).some((e) => e?.node?.image?.url);
+    if (!hasImage) problems.push(SKU_PROBLEMS.NO_PIC);
+  }
   return problems;
 }
 
