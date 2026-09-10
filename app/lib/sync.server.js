@@ -135,6 +135,34 @@ function extractWeight(variant) {
   return `${weightData.value} ${weightData.unit ?? ""}`.trim();
 }
 
+// ── Canonical JSON for order-insensitive change detection ─────────────────────
+// ProductInfo.inventory is a {locationId: {...}} map and .collections a list of
+// titles; Shopify may return the same data in a different edge order between
+// syncs. Sort keys and arrays before diffing so a reorder is not logged as a
+// change. Non-JSON input falls back to a trimmed string.
+function sortDeep(value) {
+  if (Array.isArray(value)) return value.map(sortDeep).sort(cmpCanonical);
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, key) => { acc[key] = sortDeep(value[key]); return acc; }, {});
+  }
+  return value;
+}
+function cmpCanonical(a, b) {
+  const sa = a && typeof a === "object" ? JSON.stringify(a) : String(a);
+  const sb = b && typeof b === "object" ? JSON.stringify(b) : String(b);
+  return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+function canonicalJson(raw) {
+  if (raw == null) return null;
+  try {
+    return JSON.stringify(sortDeep(JSON.parse(raw)));
+  } catch {
+    return String(raw).trim();
+  }
+}
+
 // ── Check if sync was cancelled ───────────────────────────────────────────────
 async function isCancelled(shopId) {
   try {
@@ -304,8 +332,9 @@ export async function detectAndWriteChanges(product, shopId) {
     title:       product.title  ?? null,
     vendor:      product.vendor ?? null,
     price, weight, condition,
-    inventory:   inventoryJson,
-    collections, imageUrl,
+    inventory:   canonicalJson(inventoryJson),
+    collections: canonicalJson(collections),
+    imageUrl,
   };
 
   let existing;
@@ -324,8 +353,8 @@ export async function detectAndWriteChanges(product, shopId) {
     price:       existing.price,
     weight:      existing.weight,
     condition:   existing.condition,
-    inventory:   existing.inventory,
-    collections: existing.collections,
+    inventory:   canonicalJson(existing.inventory),
+    collections: canonicalJson(existing.collections),
     imageUrl:    existing.imageUrl,
   };
 

@@ -173,4 +173,68 @@ describe("runInitSyncPass2 — feeds SkuHistory via detectAndWriteChanges", () =
     expect(prismaMock.skuHistory.create).not.toHaveBeenCalled();
     expect(prismaMock.productInfo.upsert).toHaveBeenCalledTimes(1);
   });
+
+  it("does not log a change when inventory / collections only differ in order", async () => {
+    const twoLocationVariant = {
+      price: "42.00",
+      sku: "123456",
+      inventoryItem: {
+        measurement: { weight: { value: 2, unit: "KILOGRAMS" } },
+        inventoryLevels: {
+          edges: [
+            {
+              node: {
+                location: { id: "gid://shopify/Location/1", name: "Main" },
+                quantities: [{ quantity: 5 }],
+              },
+            },
+            {
+              node: {
+                location: { id: "gid://shopify/Location/2", name: "Annex" },
+                quantities: [{ quantity: 3 }],
+              },
+            },
+          ],
+        },
+      },
+    };
+    const node = productNode({
+      variants: { edges: [{ node: twoLocationVariant }] },
+      collections: {
+        edges: [{ node: { title: "Denim" } }, { node: { title: "Vintage" } }],
+      },
+    });
+    // Stored row: same data, reversed location order + reversed inner keys, and
+    // collections listed the other way round.
+    prismaMock.productInfo.findUnique.mockResolvedValue(
+      productInfoRow({
+        inventory: JSON.stringify({
+          "gid://shopify/Location/2": { quantity: 3, name: "Annex" },
+          "gid://shopify/Location/1": { quantity: 5, name: "Main" },
+        }),
+        collections: JSON.stringify(["Vintage", "Denim"]),
+      }),
+    );
+    const graphql = graphqlOnePage(node);
+
+    await runInitSyncPass2({ graphql }, TEST_SHOP, null, "fast");
+
+    expect(prismaMock.skuHistory.create).not.toHaveBeenCalled();
+  });
+
+  it("still logs a real inventory quantity change", async () => {
+    prismaMock.productInfo.findUnique.mockResolvedValue(
+      productInfoRow({
+        inventory: JSON.stringify({
+          "gid://shopify/Location/1": { name: "Main", quantity: 99 },
+        }),
+      }),
+    );
+    const graphql = graphqlOnePage(productNode());
+
+    await runInitSyncPass2({ graphql }, TEST_SHOP, null, "fast");
+
+    expect(prismaMock.skuHistory.create).toHaveBeenCalledTimes(1);
+    expect(prismaMock.skuHistory.create.mock.calls[0][0].data.field).toBe("inventory");
+  });
 });
