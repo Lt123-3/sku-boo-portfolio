@@ -53,7 +53,7 @@ const { action: deleteAction } = await import(
 );
 const { handleProductDeleted } = await import("../app/lib/sync.server.js");
 
-// A GraphQL product node in the drip shape: valid 6-digit SKU, real image.
+// A GraphQL product node in the drip shape: valid 6-digit SKU, 3 real images.
 function graphqlProductNode(overrides = {}) {
   return {
     id: GID,
@@ -62,7 +62,11 @@ function graphqlProductNode(overrides = {}) {
     createdAt: "2026-01-01T00:00:00Z",
     updatedAt: "2026-09-09T00:00:00Z",
     variants: { edges: [{ node: { sku: "123456" } }] },
-    featuredImage: { url: "https://cdn.example/x.jpg" },
+    media: {
+      edges: [0, 1, 2].map((i) => ({
+        node: { image: { url: `https://cdn.example/${i}.jpg` } },
+      })),
+    },
     ...overrides,
   };
 }
@@ -117,7 +121,7 @@ describe.each([
     const [queryArg, optsArg] = graphql.mock.calls[0];
     expect(queryArg).toContain("product(id: $id)");
     expect(queryArg).toContain("variants(first: 1)");
-    expect(queryArg).toContain("featuredImage { url }");
+    expect(queryArg).toContain('media(first: 10, query: "media_type:IMAGE")');
     expect(optsArg).toEqual({ variables: { id: GID } });
     expect(res.status).toBe(200);
   });
@@ -139,6 +143,8 @@ describe.each([
     expect(arg.update.productId).toBe(GID);
     expect(arg.create.status).toBe("active");
     expect(JSON.parse(arg.create.problems)).toEqual([]);
+    expect(arg.create.imageCount).toBe(3);
+    expect(arg.update.imageCount).toBe(3);
   });
 
   it("never routes the raw REST payload into the upsert path", async () => {
@@ -151,7 +157,7 @@ describe.each([
 
     await getAction()({ request: req() });
 
-    // The raw payload (variants: [], no featuredImage, integer id) would have
+    // The raw payload (variants: [], no media, integer id) would have
     // produced a `gid-...` placeholder row keyed off the bare integer.
     const arg = prismaMock.skuIndex.upsert.mock.calls[0][0];
     expect(String(arg.where.skuNumber)).not.toMatch(/^gid-/);

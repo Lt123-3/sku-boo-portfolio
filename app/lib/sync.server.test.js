@@ -1,22 +1,55 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   detectProblems,
+  countProductImages,
   getThrottleDelay,
   formatEta,
 } from "./sync.server.js";
 
+// media(query: "media_type:IMAGE") edges — n image nodes.
+function imageMedia(n) {
+  return {
+    edges: Array.from({ length: n }, (_, i) => ({
+      node: { image: { url: `https://cdn.example/${i}.jpg` } },
+    })),
+  };
+}
+
 // A product/variant pair that trips no problem checks: 6-digit SKU,
-// "<digits> - <body>" title, and an image present.
+// "<digits> - <body>" title, and 3+ images.
 function cleanProduct(overrides = {}) {
   return {
     product: {
       title: "123456 - Vintage Denim Jacket",
-      featuredImage: { url: "https://cdn.example/x.jpg" },
+      media: imageMedia(3),
       ...overrides.product,
     },
     variant: { sku: "123456", ...overrides.variant },
   };
 }
+
+describe("countProductImages", () => {
+  it("counts image edges from a media-shape payload", () => {
+    expect(countProductImages({ media: imageMedia(0) })).toBe(0);
+    expect(countProductImages({ media: imageMedia(2) })).toBe(2);
+    expect(countProductImages({ media: imageMedia(9) })).toBe(9);
+  });
+
+  it("ignores media edges with no image url (video / 3d / still processing)", () => {
+    expect(
+      countProductImages({ media: { edges: [{ node: {} }, { node: { image: {} } }] } }),
+    ).toBe(0);
+  });
+
+  it("falls back to legacy featuredImage as 0 or 1", () => {
+    expect(countProductImages({ featuredImage: null })).toBe(0);
+    expect(countProductImages({ featuredImage: { url: "x" } })).toBe(1);
+  });
+
+  it("returns null when no image field was fetched", () => {
+    expect(countProductImages({ title: "x" })).toBeNull();
+  });
+});
 
 describe("detectProblems", () => {
   it("returns no problems for a well-formed product", () => {
@@ -44,21 +77,21 @@ describe("detectProblems", () => {
   it("flags no_title when the product has no title", () => {
     const { variant } = cleanProduct();
     expect(
-      detectProblems({ title: null, featuredImage: { url: "x" } }, variant),
+      detectProblems({ title: null, media: imageMedia(3) }, variant),
     ).toEqual(["no_title"]);
   });
 
   it("flags no_title when the title has neither a numeric prefix nor body", () => {
     const { variant } = cleanProduct();
     expect(
-      detectProblems({ title: "Vintage Lamp", featuredImage: { url: "x" } }, variant),
+      detectProblems({ title: "Vintage Lamp", media: imageMedia(3) }, variant),
     ).toEqual(["no_title"]);
   });
 
   it("flags no_title_body when the title is a bare numeric prefix", () => {
     const { variant } = cleanProduct();
     expect(
-      detectProblems({ title: "123456-", featuredImage: { url: "x" } }, variant),
+      detectProblems({ title: "123456-", media: imageMedia(3) }, variant),
     ).toEqual(["no_title_body"]);
   });
 
@@ -66,23 +99,16 @@ describe("detectProblems", () => {
     const { variant } = cleanProduct();
     expect(
       detectProblems(
-        { title: "123456 – Vintage Lamp", featuredImage: { url: "x" } },
+        { title: "123456 – Vintage Lamp", media: imageMedia(3) },
         variant,
       ),
     ).toEqual([]);
   });
 
-  it("flags no_pic when the featuredImage-shape payload has no image", () => {
+  it("flags no_pic when a media-shape payload carries zero images", () => {
     const { variant } = cleanProduct();
     expect(
-      detectProblems({ title: "123456 - Lamp", featuredImage: null }, variant),
-    ).toEqual(["no_pic"]);
-  });
-
-  it("flags no_pic when the media-shape payload carries no image", () => {
-    const { variant } = cleanProduct();
-    expect(
-      detectProblems({ title: "123456 - Lamp", media: { edges: [] } }, variant),
+      detectProblems({ title: "123456 - Lamp", media: imageMedia(0) }, variant),
     ).toEqual(["no_pic"]);
     // media present but only a non-image (video / 3d model) → still no picture
     expect(
@@ -93,20 +119,37 @@ describe("detectProblems", () => {
     ).toEqual(["no_pic"]);
   });
 
-  it("does not flag no_pic when the media-shape payload has an image", () => {
+  it("flags low_pic for 1–2 images", () => {
     const { variant } = cleanProduct();
     expect(
-      detectProblems(
-        {
-          title: "123456 - Lamp",
-          media: { edges: [{ node: { image: { url: "https://cdn.example/x.jpg" } } }] },
-        },
-        variant,
-      ),
+      detectProblems({ title: "123456 - Lamp", media: imageMedia(1) }, variant),
+    ).toEqual(["low_pic"]);
+    expect(
+      detectProblems({ title: "123456 - Lamp", media: imageMedia(2) }, variant),
+    ).toEqual(["low_pic"]);
+  });
+
+  it("flags nothing for 3+ images", () => {
+    const { variant } = cleanProduct();
+    expect(
+      detectProblems({ title: "123456 - Lamp", media: imageMedia(3) }, variant),
+    ).toEqual([]);
+    expect(
+      detectProblems({ title: "123456 - Lamp", media: imageMedia(10) }, variant),
     ).toEqual([]);
   });
 
-  it("leaves no_pic unjudged when the payload fetched no image field at all", () => {
+  it("still buckets from a legacy featuredImage payload", () => {
+    const { variant } = cleanProduct();
+    expect(
+      detectProblems({ title: "123456 - Lamp", featuredImage: null }, variant),
+    ).toEqual(["no_pic"]);
+    expect(
+      detectProblems({ title: "123456 - Lamp", featuredImage: { url: "x" } }, variant),
+    ).toEqual(["low_pic"]);
+  });
+
+  it("leaves picture problems unjudged when no image field was fetched", () => {
     const { variant } = cleanProduct();
     expect(
       detectProblems({ title: "123456 - Lamp" }, variant),
@@ -115,7 +158,7 @@ describe("detectProblems", () => {
 
   it("accumulates every problem, in detection order", () => {
     expect(
-      detectProblems({ title: null, featuredImage: null }, { sku: null }),
+      detectProblems({ title: null, media: imageMedia(0) }, { sku: null }),
     ).toEqual(["no_sku", "no_title", "no_pic"]);
   });
 });

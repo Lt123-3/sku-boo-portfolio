@@ -70,7 +70,9 @@ export const loader = async ({ request }) => {
           ... on Product {
             id
             title
-            featuredImage { url }
+            media(first: 1, query: "media_type:IMAGE") {
+              edges { node { ... on MediaImage { image { url } } } }
+            }
           }
         }
       }`,
@@ -86,7 +88,7 @@ export const loader = async ({ request }) => {
         if (node && node.__typename === "Product") {
           productMap[node.id] = {
             title:    node.title,
-            imageUrl: node.featuredImage?.url ?? null,
+            imageUrl: node.media?.edges?.[0]?.node?.image?.url ?? null,
           };
         }
       }

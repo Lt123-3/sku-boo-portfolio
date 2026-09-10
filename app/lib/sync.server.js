@@ -56,6 +56,24 @@ export function formatEta(processed, total, startTime) {
   return `~${remainingMins} minutes remaining`;
 }
 
+// ── Image counting ───────────────────────────────────────────────────────────
+// Count image-type media on a GraphQL product payload. Every sync path now
+// selects `media(first: 10, query: "media_type:IMAGE")`, so this is the number
+// of image edges (naturally capped at 10). Returns null when the payload carried
+// no image data at all — neither `media` nor a legacy `featuredImage` — so
+// callers can leave picture problems unjudged rather than guess from an absent
+// field (`Product.featuredImage` is deprecated and often null on products that
+// do have images).
+export function countProductImages(product) {
+  if (product?.media && Array.isArray(product.media.edges)) {
+    return product.media.edges.filter((e) => e?.node?.image?.url).length;
+  }
+  if (product && "featuredImage" in product) {
+    return product.featuredImage ? 1 : 0;
+  }
+  return null;
+}
+
 // ── Problem detection ─────────────────────────────────────────────────────────
 export function detectProblems(product, variant) {
   const problems = [];
@@ -74,17 +92,12 @@ export function detectProblems(product, variant) {
     if (hasTitleSku  && !hasTitleBody) problems.push(SKU_PROBLEMS.NO_TITLE_BODY);
   }
 
-  // no_pic — judge only from image data the payload actually included. The drip /
-  // webhook / Pass 1 queries select `featuredImage`; the cron / Pass 2 queries
-  // select `media(first: 10)` instead and never `featuredImage`. Reading
-  // `featuredImage` on a media-shape payload is a false positive, so leave the
-  // dimension alone when neither field was fetched.
-  if ("featuredImage" in product) {
-    if (!product.featuredImage) problems.push(SKU_PROBLEMS.NO_PIC);
-  } else if (product.media) {
-    const hasImage = (product.media.edges ?? []).some((e) => e?.node?.image?.url);
-    if (!hasImage) problems.push(SKU_PROBLEMS.NO_PIC);
-  }
+  // Picture problems, bucketed by image count: 0 → no_pic, 1–2 → low_pic,
+  // 3+ → fine. null (no image data fetched) leaves the dimension alone.
+  const imageCount = countProductImages(product);
+  if (imageCount === 0)                          problems.push(SKU_PROBLEMS.NO_PIC);
+  else if (imageCount === 1 || imageCount === 2) problems.push(SKU_PROBLEMS.LOW_PIC);
+
   return problems;
 }
 
@@ -179,6 +192,7 @@ export async function upsertSkuIndexRow(product, shopId) {
   const sku       = variant?.sku ?? null;
   const title     = product.title ?? null;
   const rawProblems = detectProblems(product, variant);
+  const imageCount  = countProductImages(product);
   const skuNumber = (sku && SKU_REGEX.test(sku)) ? sku : null;
 
   if (!skuNumber) {
@@ -192,6 +206,7 @@ export async function upsertSkuIndexRow(product, shopId) {
           title,
           status:   SKU_STATUS.PROBLEM,
           problems: JSON.stringify([SKU_PROBLEMS.NO_SKU]),
+          imageCount,
           syncedAt: new Date(),
         },
         create: {
@@ -203,6 +218,7 @@ export async function upsertSkuIndexRow(product, shopId) {
           title,
           status:     SKU_STATUS.PROBLEM,
           problems:   JSON.stringify([SKU_PROBLEMS.NO_SKU]),
+          imageCount,
           reservedAt: product.createdAt ? new Date(product.createdAt) : null,
           syncedAt:   new Date(),
         },
@@ -237,6 +253,7 @@ export async function upsertSkuIndexRow(product, shopId) {
         title,
         status,
         problems:   JSON.stringify(problems),
+        imageCount,
         syncedAt:   new Date(),
       },
       create: {
@@ -248,6 +265,7 @@ export async function upsertSkuIndexRow(product, shopId) {
         title,
         status,
         problems:   JSON.stringify(problems),
+        imageCount,
         reservedAt: product.createdAt ? new Date(product.createdAt) : null,
         syncedAt:   new Date(),
       },
@@ -273,7 +291,7 @@ export async function upsertProductInfoRow(product, shopId) {
   const weight        = extractWeight(variant);
   const collections   = (product.collections?.edges ?? []).map((e) => e.node.title);
   const mediaEdges    = product.media?.edges ?? [];
-  const imageCount    = mediaEdges.length;
+  const imageCount    = countProductImages(product) ?? mediaEdges.length;
   const condition     = product.metafield?.value ?? null;
   const price         = variant?.price ?? null;
 
@@ -447,7 +465,9 @@ export async function runDripSync(admin, shopId) {
             node {
               id title status createdAt updatedAt
               variants(first: 1) { edges { node { sku } } }
-              featuredImage { url }
+              media(first: 10, query: "media_type:IMAGE") {
+                edges { node { ... on MediaImage { image { url } } } }
+              }
             }
           }
         }
@@ -477,7 +497,9 @@ const WEBHOOK_PRODUCT_QUERY = `#graphql
     product(id: $id) {
       id title status createdAt updatedAt
       variants(first: 1) { edges { node { sku } } }
-      featuredImage { url }
+      media(first: 10, query: "media_type:IMAGE") {
+        edges { node { ... on MediaImage { image { url } } } }
+      }
     }
   }`;
 
@@ -569,7 +591,7 @@ async function runCronCycle(admin, shopId) {
           edges {
             node {
               id title vendor updatedAt
-              media(first: 10) {
+              media(first: 10, query: "media_type:IMAGE") {
                 edges { node { ... on MediaImage { image { url } } } }
               }
               collections(first: 20) { edges { node { title } } }
@@ -664,7 +686,9 @@ export async function runInitSyncPass1(admin, shopId, resumeCursor = null, speed
               node {
                 id title status createdAt updatedAt
                 variants(first: 1) { edges { node { sku } } }
-                featuredImage { url }
+                media(first: 10, query: "media_type:IMAGE") {
+                  edges { node { ... on MediaImage { image { url } } } }
+                }
               }
             }
           }
@@ -751,7 +775,7 @@ export async function runInitSyncPass2(admin, shopId, resumeCursor = null, speed
             edges {
               node {
                 id title vendor updatedAt
-                media(first: 10) {
+                media(first: 10, query: "media_type:IMAGE") {
                   edges { node { ... on MediaImage { image { url } } } }
                 }
                 collections(first: 20) { edges { node { title } } }
