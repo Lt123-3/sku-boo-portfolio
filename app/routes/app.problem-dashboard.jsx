@@ -2,9 +2,54 @@
 
 import { authenticate }              from "../shopify.server.js";
 import { useFetcher, useLoaderData } from "react-router";
-import { useState }                  from "react";
+import { useEffect, useState }       from "react";
 import { validateSkuSession }        from "../lib/access.server.js";
 import prisma                        from "../db.server.js";
+
+// ── Pictures section query (shared by loader + pictures_query action) ──────────
+// Rows whose active problems include no_pic (0 images) or low_pic (1–2). Search
+// matches title or SKU; sort is by fewest images first, or most recently synced.
+async function queryPictures({ shopId, search = "", sort = "fewest", take = 8 }) {
+  const where = {
+    shopId,
+    OR: [
+      { problems: { contains: '"no_pic"'  } },
+      { problems: { contains: '"low_pic"' } },
+    ],
+  };
+  if (search) {
+    where.AND = [{
+      OR: [
+        { title:     { contains: search } },
+        { skuNumber: { contains: search } },
+      ],
+    }];
+  }
+
+  const orderBy = sort === "recent"
+    ? [{ updatedAt: "desc" }]
+    : [{ imageCount: "asc" }, { updatedAt: "desc" }];
+
+  const [rowsRaw, total] = await Promise.all([
+    prisma.skuIndex.findMany({ where, orderBy, take: take + 25 }),
+    prisma.skuIndex.count({ where }),
+  ]);
+
+  const rows = rowsRaw
+    .filter((r) => {
+      const problems = JSON.parse(r.problems ?? "[]");
+      const excluded = JSON.parse(r.excludedProblems ?? "[]");
+      return (problems.includes("no_pic")  && !excluded.includes("no_pic"))
+          || (problems.includes("low_pic") && !excluded.includes("low_pic"));
+    })
+    .slice(0, take);
+
+  const ids   = rows.map((r) => r.productId).filter(Boolean);
+  const infos = ids.length > 0 ? await prisma.productInfo.findMany({ where: { productId: { in: ids } } }) : [];
+  const infoMap = Object.fromEntries(infos.map((i) => [i.productId, i]));
+
+  return { rows: rows.map((r) => ({ ...r, info: infoMap[r.productId] ?? null })), total };
+}
 
 // ── Loader ────────────────────────────────────────────────────────────────────
 export async function loader({ request }) {
@@ -34,6 +79,12 @@ export async function loader({ request }) {
   const freeNumbersCount = countNotExcluded("no_title_body");
   const fixTitlesCount   = countNotExcluded("no_title");
   const noSkuCount       = countNotExcluded("no_sku");
+  const picturesCount    = allSkuIndex.filter((r) => {
+    const problems = JSON.parse(r.problems ?? "[]");
+    const excluded = JSON.parse(r.excludedProblems ?? "[]");
+    return (problems.includes("no_pic")  && !excluded.includes("no_pic"))
+        || (problems.includes("low_pic") && !excluded.includes("low_pic"));
+  }).length;
 
   async function fetchSection(problemType, take = 5) {
     const rows = await prisma.skuIndex.findMany({
@@ -49,10 +100,11 @@ export async function loader({ request }) {
       .slice(0, take);
   }
 
-  const [freeNumbers, fixTitles, noSkus] = await Promise.all([
+  const [freeNumbers, fixTitles, noSkus, pictures] = await Promise.all([
     fetchSection("no_title_body"),
     fetchSection("no_title"),
     fetchSection("no_sku"),
+    queryPictures({ shopId, sort: "fewest", take: 8 }),
   ]);
 
   const allProductIds = [
@@ -77,10 +129,12 @@ export async function loader({ request }) {
 
   return {
     shopId,
-    counts: { freeNumbersCount, fixTitlesCount, noSkuCount },
-    freeNumbers: enrich(freeNumbers),
-    fixTitles:   enrich(fixTitles),
-    noSkus:      enrich(noSkus),
+    counts: { freeNumbersCount, fixTitlesCount, noSkuCount, picturesCount },
+    freeNumbers:   enrich(freeNumbers),
+    fixTitles:     enrich(fixTitles),
+    noSkus:        enrich(noSkus),
+    pictures:      pictures.rows,
+    picturesTotal: pictures.total,
     recentLog,
   };
 }
@@ -299,6 +353,15 @@ export async function action({ request }) {
     const infoMap    = Object.fromEntries(infos.map((i) => [i.productId, i]));
 
     return Response.json({ success: true, rows: filtered.map((r) => ({ ...r, info: infoMap[r.productId] ?? null })) });
+  }
+
+  if (intent === "pictures_query") {
+    const search = (formData.get("search") ?? "").toString().trim();
+    const sort   = (formData.get("sort")   ?? "fewest").toString();
+    const take   = Math.min(parseInt(formData.get("take") ?? "8", 10) || 8, 200);
+
+    const pictures = await queryPictures({ shopId, search, sort, take });
+    return Response.json({ success: true, pictures });
   }
 
   return Response.json({ success: false, error: "Unknown action" });
@@ -614,12 +677,143 @@ function RichList({ initialRows, totalCount, problemType, sectionKey, sessionId,
   );
 }
 
+// ── Pictures section ─────────────────────────────────────────────────────────
+function PictureRow({ row, shopHandle, onAction }) {
+  const info = row.info;
+  const n    = row.imageCount;
+
+  let isNoPic = false;
+  try { isNoPic = JSON.parse(row.problems ?? "[]").includes("no_pic"); } catch {}
+  const problemType = isNoPic ? "no_pic" : "low_pic";
+
+  const badge =
+    n == null ? "— images" :
+    n === 1   ? "1 image"  :
+    `${n} images`;
+
+  return (
+    <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "24px", padding: "18px 20px", borderBottom: "1px solid #e1e3e5", background: "#ffffff" }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+          <span style={{ fontSize: "16px", fontWeight: "700", color: "#202223", lineHeight: "1.3" }}>{row.title ?? "—"}</span>
+          {row.skuNumber && (
+            <span style={{ fontFamily: "monospace", fontSize: "12px", color: "#6d7175", background: "#f1f1f1", borderRadius: "4px", padding: "2px 8px" }}>{row.skuNumber}</span>
+          )}
+          <span style={{
+            fontSize: "11px", fontWeight: "700", borderRadius: "4px", padding: "2px 8px",
+            background: problemType === "no_pic" ? "#fff0f0" : "#fff8e1",
+            color:      problemType === "no_pic" ? "#d82c0d" : "#8a6200",
+          }}>
+            {badge}
+          </span>
+        </div>
+        <div style={{ marginTop: "8px", lineHeight: "1.8" }}>
+          <Meta label="Vendor"    value={info?.vendor    ?? null} />
+          <Meta label="Price"     value={info?.price     ? `$${info.price}` : null} />
+          <Meta label="Condition" value={info?.condition ?? null} />
+        </div>
+        <CollectionTags collections={info?.collections ?? null} />
+        {row.syncedAt && (
+          <div style={{ marginTop: "6px", fontSize: "11px", color: "#adb5bd" }}>
+            Synced {new Date(row.syncedAt).toLocaleString()}
+          </div>
+        )}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: "8px", flexShrink: 0, alignItems: "flex-end" }}>
+        <s-button variant="primary" onClick={() => window.open(`https://admin.shopify.com/store/${shopHandle}/products/${row.productId?.split("/").pop()}`, "_blank")}>Add photos</s-button>
+        <s-button variant="secondary" onClick={() => onAction("pass_problem", { skuIndexId: String(row.id), problemType })}>Exclude</s-button>
+      </div>
+    </div>
+  );
+}
+
+function PicturesSection({ initialRows, initialTotal, sessionId, onAction, shopId }) {
+  const fetcher = useFetcher();
+  const [rows,  setRows]  = useState(initialRows ?? []);
+  const [total, setTotal] = useState(initialTotal ?? 0);
+  const [take,  setTake]  = useState(initialRows?.length ?? 8);
+  const [searchInput, setSearchInput] = useState("");
+  const [search, setSearch] = useState("");
+  const [sort,   setSort]   = useState("fewest");
+
+  const shopHandle = shopId?.replace(".myshopify.com", "") ?? "";
+  const busy       = fetcher.state !== "idle";
+
+  function submit(nextTake, nextSearch, nextSort) {
+    setTake(nextTake);
+    setSearch(nextSearch);
+    setSort(nextSort);
+    fetcher.submit(
+      { intent: "pictures_query", sessionId, search: nextSearch, sort: nextSort, take: String(nextTake) },
+      { method: "POST", action: "/app/problem-dashboard" },
+    );
+  }
+
+  useEffect(() => {
+    if (fetcher.data?.pictures) {
+      setRows(fetcher.data.pictures.rows);
+      setTotal(fetcher.data.pictures.total);
+    }
+  }, [fetcher.data]);
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", marginBottom: "16px", alignItems: "center" }}>
+        <form
+          onSubmit={(e) => { e.preventDefault(); submit(8, searchInput.trim(), sort); }}
+          style={{ display: "flex", gap: "8px", flex: "1 1 260px" }}
+        >
+          <input
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
+            placeholder="Search title or SKU…"
+            style={{ flex: 1, padding: "8px 12px", border: "2px solid #e1e3e5", borderRadius: "6px", fontSize: "14px" }}
+          />
+          <s-button variant="secondary" onClick={() => submit(8, searchInput.trim(), sort)}>Search</s-button>
+          {search && (
+            <s-button variant="secondary" onClick={() => { setSearchInput(""); submit(8, "", sort); }}>Clear</s-button>
+          )}
+        </form>
+        <select
+          value={sort}
+          onChange={(e) => submit(8, search, e.target.value)}
+          style={{ padding: "8px 12px", border: "2px solid #e1e3e5", borderRadius: "6px", fontSize: "14px" }}
+        >
+          <option value="fewest">Fewest images first</option>
+          <option value="recent">Most recently synced</option>
+        </select>
+      </div>
+
+      {rows.length === 0 ? (
+        <div style={{ fontSize: "14px", color: "#6d7175", padding: "16px 0" }}>
+          {search ? "No picture problems match that search." : "No products with picture problems."}
+        </div>
+      ) : (
+        <>
+          <div style={{ border: "1px solid #e1e3e5", borderRadius: "8px", overflow: "hidden", opacity: busy ? 0.6 : 1 }}>
+            {rows.map((row) => (
+              <PictureRow key={row.id} row={row} shopHandle={shopHandle} onAction={onAction} />
+            ))}
+          </div>
+          {rows.length < total && (
+            <div style={{ marginTop: "16px", textAlign: "center" }}>
+              <s-button variant="secondary" onClick={() => submit(take + 8, search, sort)} {...(busy ? { loading: true } : {})}>
+                View more ({total - rows.length} remaining)
+              </s-button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 export default function ProblemDashboard() {
   const loaderData = useLoaderData();
   const fetcher    = useFetcher();
 
-  const { counts, freeNumbers, fixTitles, noSkus, shopId, recentLog } = loaderData ?? {};
+  const { counts, freeNumbers, fixTitles, noSkus, pictures, picturesTotal, shopId, recentLog } = loaderData ?? {};
 
   const [activeSection, setActiveSection] = useState("free_numbers");
   const [message, setMessage]             = useState(null);
@@ -642,6 +836,7 @@ export default function ProblemDashboard() {
     free_numbers: { label: "Free Numbers", count: counts?.freeNumbersCount, color: "#005bd3", description: "Has a SKU prefix but no title body — slot may be reusable", rows: freeNumbers, problemType: "no_title_body" },
     fix_titles:   { label: "Fix Titles",   count: counts?.fixTitlesCount,   color: "#f0a500", description: "Has a title body but missing the SKU number prefix",         rows: fixTitles,  problemType: "no_title"      },
     no_sku:       { label: "No SKU",       count: counts?.noSkuCount,       color: "#d82c0d", description: "Product has no valid 6-digit SKU assigned",                  rows: noSkus,     problemType: "no_sku"        },
+    pictures:     { label: "Pictures",     count: counts?.picturesCount,    color: "#7b3fe4", description: "0 images (no_pic) or only 1–2 (low_pic)",                    rows: pictures,   problemType: "pictures"      },
   };
 
   const active = sections[activeSection];
@@ -686,16 +881,27 @@ export default function ProblemDashboard() {
             </div>
           )}
 
-          <RichList
-            key={activeSection}
-            initialRows={active.rows}
-            totalCount={active.count ?? 0}
-            problemType={active.problemType}
-            sectionKey={activeSection}
-            sessionId={sessionId}
-            onAction={handleAction}
-            shopId={shopId}
-          />
+          {activeSection === "pictures" ? (
+            <PicturesSection
+              key="pictures"
+              initialRows={pictures ?? []}
+              initialTotal={picturesTotal ?? 0}
+              sessionId={sessionId}
+              onAction={handleAction}
+              shopId={shopId}
+            />
+          ) : (
+            <RichList
+              key={activeSection}
+              initialRows={active.rows}
+              totalCount={active.count ?? 0}
+              problemType={active.problemType}
+              sectionKey={activeSection}
+              sessionId={sessionId}
+              onAction={handleAction}
+              shopId={shopId}
+            />
+          )}
         </s-section>
 
         {/* ── Recent Problem Log ── */}
