@@ -3,6 +3,7 @@ import "@shopify/shopify-app-react-router/adapters/node";
 import {
   ApiVersion,
   AppDistribution,
+  DeliveryMethod,
   shopifyApp,
 } from "@shopify/shopify-app-react-router/server";
 import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
@@ -20,20 +21,28 @@ const shopify = shopifyApp({
   future: {
     expiringOfflineAccessTokens: true,
   },
+  // Shop-specific webhook registration. registerWebhooks() (called in afterAuth,
+  // below) reconciles this map against the shop via the Admin GraphQL API using
+  // the session token — no `shopify app deploy` / linked app required. Keep this
+  // the single source of truth: there are deliberately no [[webhooks.subscriptions]]
+  // in shopify.app.toml (declaring both would double-register).
   webhooks: {
-    ApiVersion: ApiVersion.October25,
-    deliveryMethod: "Http",
-    endpointApiVersion: "2026-07",
+    PRODUCTS_CREATE:   { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/products/create" },
+    PRODUCTS_UPDATE:   { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/products/update" },
+    PRODUCTS_DELETE:   { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/products/delete" },
+    APP_UNINSTALLED:   { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/app/uninstalled" },
+    APP_SCOPES_UPDATE: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/app/scopes_update" },
   },
   hooks: {
-    afterAuth: async (request) => {
-      const { admin, session } = await shopify.authenticate.admin(request);
-      if (!session || !admin) return;
+    // Called after install and after an offline-token refresh. afterAuth receives
+    // { session, admin } — not a Request — so use session directly. Swallow errors
+    // so a transient registration failure can't turn the auth flow into a 500.
+    afterAuth: async ({ session }) => {
       try {
         await shopify.registerWebhooks({ session });
-        console.log("[afterAuth] Webhooks registered for shop:", session.shop);
+        console.log("[afterAuth] webhooks registered:", session.shop);
       } catch (err) {
-        console.error("[afterAuth] Failed to register webhooks:", session.shop, err);
+        console.error("[afterAuth] registerWebhooks failed:", session?.shop, err);
       }
     },
   },
