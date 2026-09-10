@@ -767,6 +767,10 @@ export async function runInitSyncPass2(admin, shopId, resumeCursor = null, speed
     const products = page.edges.map((e) => e.node);
 
     for (const product of products) {
+      // Match runCronCycle: diff against the pre-cycle ProductInfo row before
+      // upsertProductInfoRow overwrites it, so full-catalog re-syncs also feed
+      // SkuHistory. (No-op on the first Pass 2 — no row to diff against yet.)
+      await detectAndWriteChanges(product, shopId);
       await upsertProductInfoRow(product, shopId);
     }
 
