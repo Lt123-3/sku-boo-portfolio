@@ -29,6 +29,14 @@ export function weightToLb(weight) {
 // deployment serves. Filtered by SHOP_DOMAIN, not just findFirst() — dev and
 // prod currently share one Session table, so an unfiltered lookup can
 // silently grab the wrong shop's session.
+//
+// Returns shopId alongside admin — resolved from the matched session row
+// (the same `session.shop` the admin routes use to scope Prisma rows), not
+// the raw env var. SHOP_DOMAIN only picks which session to load here;
+// callers that then read/write shop-scoped rows (SavedPackage, OrderSaving,
+// ...) should use the returned shopId so they stay consistent with the
+// admin UI's write path even if SHOP_DOMAIN's formatting ever drifts from
+// the canonical value Shopify stored on the session.
 export async function getShopAdmin() {
   if (!process.env.SHOP_DOMAIN) {
     throw new Error("Server misconfigured: SHOP_DOMAIN not set");
@@ -40,7 +48,7 @@ export async function getShopAdmin() {
     throw new Error(`No session found for shop ${process.env.SHOP_DOMAIN}`);
   }
   const { admin } = await unauthenticated.admin(session.shop);
-  return admin;
+  return { admin, shopId: session.shop };
 }
 
 const ORDER_FIELDS = `

@@ -63,8 +63,9 @@ function send(ws, message) {
 }
 
 async function sendOrdersAndPackages(ws) {
+  let admin, shopId;
   try {
-    const admin = await getShopAdmin();
+    ({ admin, shopId } = await getShopAdmin());
     const orders = await listRecentOrders(admin, 25);
     send(ws, {
       type: "orders",
@@ -80,8 +81,12 @@ async function sendOrdersAndPackages(ws) {
   }
 
   try {
+    // Falls back to SHOP_DOMAIN only if the getShopAdmin() call above failed
+    // before resolving shopId — keeps the packages push working even when
+    // Shopify auth is down, same as this endpoint's behavior before shopId
+    // was resolved via the session row.
     const packages = await prisma.savedPackage.findMany({
-      where: { shopId: process.env.SHOP_DOMAIN },
+      where: { shopId: shopId ?? process.env.SHOP_DOMAIN },
       orderBy: { name: "asc" },
     });
     send(ws, {
@@ -102,7 +107,7 @@ async function handleSubmit(ws, msg) {
   }
 
   try {
-    const admin = await getShopAdmin();
+    const { admin, shopId } = await getShopAdmin();
     // Re-resolved fresh rather than reusing the summary from the orders push
     // — that push only sent id/name/item for a small screen, not the full
     // address rating needs.
@@ -113,7 +118,7 @@ async function handleSubmit(ws, msg) {
     }
 
     const pkg = await prisma.savedPackage.findFirst({
-      where: { shopId: process.env.SHOP_DOMAIN, name: packageName },
+      where: { shopId, name: packageName },
     });
     if (!pkg) {
       send(ws, { type: "error", message: `Unknown package: ${packageName}` });
@@ -145,7 +150,7 @@ async function handleSubmit(ws, msg) {
 
     await prisma.orderSaving.create({
       data: {
-        shopId: process.env.SHOP_DOMAIN,
+        shopId,
         shopifyOrderId: orderId,
         orderName,
         originalWeightLb: weightLb,
