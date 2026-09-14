@@ -54,6 +54,30 @@ just what changed for them:*
 - **Role-based access** — a lightweight PIN-based login (viewer / operator / admin) layered on top of
   standard Shopify OAuth, since most of the day-to-day users aren't the store's Shopify admins.
 
+## Screenshots
+
+*Captured on a throwaway dev store with seed/demo data — nothing here is real inventory.*
+
+**Problem Dashboard** — catalog-wide data-quality issues, flagged and searchable:
+
+![Problem Dashboard](docs/screenshots/problem-dashboard.png)
+
+**SKU Generator** — one click pulls the next free SKU and starts a new product:
+
+![SKU Generator](docs/screenshots/sku-generator.png)
+
+**Admin Panel** — sync controls, live stats, and a full change-history audit trail:
+
+![Admin Panel](docs/screenshots/admin-panel.png)
+
+**AI Settings** — configurable system prompts for Claude-generated titles and descriptions:
+
+![AI Settings](docs/screenshots/ai-settings.png)
+
+**Prep** — PIN-gated entry point for day-to-day users who aren't Shopify admins:
+
+![Prep login](docs/screenshots/prep-b.png)
+
 ## How the sync engine works
 
 Shopify doesn't offer a bulk "what changed" API, so SkuBoo layers four things to stay in sync without
