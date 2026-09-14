@@ -126,8 +126,8 @@ flowchart LR
     B -->|initial / resumable| D
     D -->|writes| I
     D -->|logs field diffs| H
-    G <-.paginated, cost-throttled.-> B
-    G <-.re-fetch by GID.-> W
+    B -.->|paginated, cost-throttled| G
+    W -.->|re-fetch by GID| G
     I --> P
 ```
 
