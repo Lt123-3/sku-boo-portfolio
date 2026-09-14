@@ -150,3 +150,16 @@ the sync/problem-detection engine, the viewer/operator/admin authorization gate,
 Actively maintained — this started as a data-entry fix and keeps growing as I find more of the business
 that manual process was slowing down. Current rough edges and what's next live in
 [`EXECUTION_PLAN.md`](EXECUTION_PLAN.md) and [`CHANGELOG.md`](CHANGELOG.md).
+
+## Beyond SkuBoo
+
+The same role also covers the office's day-to-day IT, none of which is code but all of which is part of
+keeping the place running:
+
+- Set up and maintain every office computer on a shared Windows workgroup.
+- Keep an endpoint spreadsheet tracking every machine and appliance essential to daily operations — the
+  closest thing the business has to a hardware inventory.
+- Most support requests come in by word of mouth rather than a ticketing system, so I log, document, and
+  review them in my own spreadsheet instead of letting that history disappear.
+- Wrote guides for new-computer setup, ordering and shipping, and printer/driver installs — written for
+  the next time the problem comes up, or for whoever's here after me.
