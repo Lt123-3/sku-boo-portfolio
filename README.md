@@ -54,6 +54,23 @@ just what changed for them:*
 - **Role-based access** — a lightweight PIN-based login (viewer / operator / admin) layered on top of
   standard Shopify OAuth, since most of the day-to-day users aren't the store's Shopify admins.
 
+## Why there's a hardware device
+
+The shipping desk exists because of a real but short-lived quirk in how USPS priced packages: bumping
+certain shipments up to 3 lbs was sometimes cheaper than shipping them at their true, lower weight — but
+whether it actually helped changed almost daily. Checking it the normal way meant handing a package to
+someone else, waiting on them to check, and repacking if it turned out to help. Too slow for a window
+that could close in a day.
+
+I designed and shipped an ESP32 device — a screen and a couple of buttons — so whoever's already at the
+packing desk can check in seconds, no handoff required. Built and deployed within a week, it ran for
+about two weeks and saved close to 30% on some of the most common shipments (not every order) before
+USPS changed how it calculated that rate zone and closed the window for good.
+
+The original reason for the device is gone, but the device isn't. It's now being repurposed to
+consolidate packing, rate-checking, label purchase, and printing into a single step at the desk instead
+of a multi-step handoff.
+
 ## Screenshots
 
 *Captured on a throwaway dev store with seed/demo data — nothing here is real inventory.*
