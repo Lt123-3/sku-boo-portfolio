@@ -12,19 +12,19 @@ show the engineering, not to be deployed against a live store.
 
 ## Why this exists
 
-I was hired to do Shopify product data entry. SKU assignment at the time meant a spreadsheet of raw
-numbers and checkboxes — someone had to cross-reference it by hand every time a new product went up, and
-nothing caught it if a product went live with no photos, no title, or no SKU at all until a customer or a
-warehouse pick ran into it.
+**The problem.** I was hired to do Shopify product data entry. SKU assignment at the time meant a
+spreadsheet of raw numbers and checkboxes — someone had to cross-reference it by hand every time a new
+product went up. Nothing caught it if a product went live with no photos, no title, or no SKU at all,
+until a customer or a warehouse pick ran into it.
 
-SkuBoo replaced the spreadsheet first: creating a new product in Shopify is now one click, pulling the
-next free SKU and pre-filling what it can instead of someone hunting through rows of checkboxes. From
-there it grew into catching the data-quality problems the spreadsheet never could.
+**The fix.** SkuBoo replaced the spreadsheet first: creating a new product in Shopify is now one click,
+pulling the next free SKU and pre-filling what it can instead of someone hunting through rows of
+checkboxes. From there it grew into catching the data-quality problems the spreadsheet never could.
 
-I'm self-taught, with no formal CS background, so I built SkuBoo as I learned — first to fix the SKU
-assignment problem, then to catch data-quality issues automatically, then to save time on writing product
-descriptions, then to speed up the physical packing/shipping process. It's been in daily production use
-since, and I'm still actively extending it.
+**The bigger picture.** I'm self-taught, with no formal CS background, so I built SkuBoo as I learned —
+first the SKU problem, then automated data-quality checks, then AI-assisted product descriptions, then
+the packing/shipping workflow. It's been in daily production use since, and I'm still actively extending
+it.
 
 ## Impact
 
@@ -56,20 +56,21 @@ just what changed for them:*
 
 ## Why there's a hardware device
 
-The shipping desk started with something we'd heard secondhand: that bumping certain packages up to
-3 lbs could sometimes be cheaper to ship than their true, lower weight. Before committing to any
-hardware, I built a quick Chrome extension to test the idea against real rates — which is how I found
-the rumor was off. The real breakeven point was closer to 2.1 lbs, and whether it even helped shifted
-almost daily either way.
+**The rumor.** The shipping desk started with something we'd heard secondhand: that bumping certain
+packages up to 3 lbs could sometimes be cheaper to ship than their true, lower weight. Before committing
+to any hardware, I built a quick Chrome extension to test the idea against real rates — which is how I
+found the rumor was off. The real breakeven point was closer to 2.1 lbs, and whether it even helped
+shifted almost daily either way.
 
-Checking it the normal way still meant handing a package to someone else, waiting on them to check, and
-repacking if it turned out to help — too slow for a window that could close in a day. So I designed and
-shipped a dedicated ESP32 device — a screen and a couple of buttons — so whoever's already at the packing
-desk can check in seconds, no handoff and no browser required. It went from idea to deployed hardware in
-about a week, ran for roughly two weeks, and saved close to 30% on some of the most common shipments (not
-every order) before USPS changed how it calculated that rate zone and closed the window for good.
+**The fix.** Checking it the normal way still meant handing a package to someone else, waiting on them to
+check, and repacking if it turned out to help — too slow for a window that could close in a day. So I
+designed and shipped a dedicated ESP32 device — a screen and a couple of buttons — so whoever's already
+at the packing desk can check in seconds, no handoff and no browser required. It went from idea to
+deployed hardware in about a week, ran for roughly two weeks, and saved close to 30% on some of the most
+common shipments (not every order) before USPS changed how it calculated that rate zone and closed the
+window for good.
 
-The original reason for the device is gone, but the device isn't. It's now being repurposed to
+**Now.** The original reason for the device is gone, but the device isn't. It's being repurposed to
 consolidate packing, rate-checking, label purchase, and printing into a single step at the desk instead
 of a multi-step handoff.
 
