@@ -64,11 +64,11 @@ shifted almost daily either way.
 
 **The fix.** Checking it the normal way still meant handing a package to someone else, waiting on them to
 check, and repacking if it turned out to help — too slow for a window that could close in a day. So I
-designed and shipped a dedicated ESP32 device — a screen and a couple of buttons — so whoever's already
-at the packing desk can check in seconds, no handoff and no browser required. It went from idea to
-deployed hardware in about a week, ran for roughly two weeks, and saved close to 30% on some of the most
-common shipments (not every order) before USPS changed how it calculated that rate zone and closed the
-window for good.
+designed and shipped a dedicated ESP32 device — a screen and a couple of buttons, built for under $40 in
+parts (closer to $30) — so whoever's already at the packing desk can check in seconds, no handoff and no
+browser required. It went from idea to deployed hardware in about a week, ran for roughly two weeks, and
+saved close to 30% on some of the most common shipments (not every order) before USPS changed how it
+calculated that rate zone and closed the window for good.
 
 **Now.** The original reason for the device is gone, but the device isn't. It's being repurposed to
 consolidate packing, rate-checking, label purchase, and printing into a single step at the desk instead
