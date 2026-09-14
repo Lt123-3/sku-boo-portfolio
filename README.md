@@ -70,9 +70,10 @@ required. It went from idea to deployed hardware in about a week, ran for roughl
 saved close to 30% on some of the most common shipments (not every order) before USPS changed how it
 calculated that rate zone and closed the window for good.
 
-**Now.** The original reason for the device is gone, but the device isn't. It's being repurposed to
-consolidate packing, rate-checking, label purchase, and printing into a single step at the desk instead
-of a multi-step handoff.
+**Now.** The original rate quirk is gone, but the saving it exposed was never really about the 2.1 lb
+threshold — it was cutting out the handoff between packing and rate-checking, and that's still true
+today. The device is being repurposed so one person can pack, check rates, buy, and print the label at
+the same desk instead of handing the package to someone else and repacking if it turns out to help.
 
 ## Screenshots
 
