@@ -70,6 +70,11 @@ just what changed for them:*
 
 ![Admin Panel](docs/screenshots/admin-panel.png)
 
+**Saved Packages** — shared box/envelope presets used by both the rate-check tooling and the physical
+shipping-desk device:
+
+![Saved Packages](docs/screenshots/saved-packages.png)
+
 **AI Settings** — configurable system prompts for Claude-generated titles and descriptions:
 
 ![AI Settings](docs/screenshots/ai-settings.png)
